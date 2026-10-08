@@ -5,6 +5,7 @@ import statistics
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
@@ -23,30 +24,34 @@ class WallFollower(Node):
         self.desired_left_distance = 0.30   # meters
 
         # Forward speeds
-        self.forward_speed = 0.08           # normal speed
-        self.slow_speed = 0.04              # when front gets close or wall is lost
+        self.forward_speed = 0.06           # normal speed
+        self.slow_speed = 0.03              # near obstacle / wall lost
 
         # Safety distances
-        self.front_stop_distance = 0.25     # emergency turn
-        self.front_slow_distance = 0.45     # start slowing down
-        self.left_wall_lost_distance = 0.60  # wall has disappeared -> reacquire
+        self.front_stop_distance = 0.45
+        self.front_slow_distance = 0.70
 
-        # P-controller gain
-        self.kp = 1.0
+        # If left wall is farther than this,
+        # we consider the wall lost
+        self.left_wall_lost_distance = 0.60
 
-        # Maximum turning speed
-        self.max_turn_speed = 0.45
+        # P-controller
+        self.kp = 0.5
 
-        # Turning speed when front is blocked
-        self.front_turn_speed = 0.50
-        self.reacquire_turn_speed = 0.35     # turn left to find the wall again
+        # Maximum normal steering
+        self.max_turn_speed = 0.20
+
+        # Emergency front turn
+        self.front_turn_speed = 0.30
+
+        # Turn left while searching for lost wall
+        self.reacquire_turn_speed = 0.30
 
         # Previous filtered values
         self.filtered_left = None
         self.filtered_front = None
 
-        # Smoothing factor
-        # Larger alpha = more weight on old value
+        # Low-pass filter
         self.alpha = 0.7
 
         # -------------------------------------------------
@@ -57,7 +62,7 @@ class WallFollower(Node):
             LaserScan,
             '/robot_8/scan',
             self.scan_callback,
-            10
+            qos_profile_sensor_data
         )
 
         # -------------------------------------------------
@@ -71,7 +76,7 @@ class WallFollower(Node):
         )
 
         self.get_logger().info(
-            'LiDAR wall follower started'
+            'LiDAR left-wall follower started'
         )
 
 
@@ -81,7 +86,10 @@ class WallFollower(Node):
 
     def scan_callback(self, msg):
 
-        # Get distances from useful sectors
+        # -------------------------------------------------
+        # READ LIDAR SECTORS
+        # -------------------------------------------------
+
         left_distance = self.get_sector_distance(
             msg,
             75,
@@ -103,16 +111,14 @@ class WallFollower(Node):
             use_min=False
         )
 
-        # Front is the critical safety sensor. If it is missing,
-        # we do not have enough information to drive safely.
+        # Front information is required for safety
         if front_distance is None:
 
-            self.stop_robot()
-
             self.get_logger().warn(
-                'Invalid front LiDAR data -> stopping'
+                'No valid front LiDAR data -> STOP'
             )
 
+            self.stop_robot()
             return
 
         # -------------------------------------------------
@@ -120,23 +126,39 @@ class WallFollower(Node):
         # -------------------------------------------------
 
         if left_distance is not None:
+
             self.filtered_left = self.low_pass_filter(
                 self.filtered_left,
                 left_distance
             )
 
-        left_distance = self.filtered_left
+            left_distance = self.filtered_left
+
+        else:
+
+            self.filtered_left = None
 
         self.filtered_front = self.low_pass_filter(
             self.filtered_front,
             front_distance
         )
 
-        front_distance = self.filtered_front
+        # Use current value if it detects something closer
+        # than the filtered value
+        front_distance = min(
+            front_distance,
+            self.filtered_front
+        )
 
         # -------------------------------------------------
-        # PRINT PERCEPTION
+        # DISPLAY PERCEPTION
         # -------------------------------------------------
+
+        left_text = (
+            f'{left_distance:.2f}'
+            if left_distance is not None
+            else 'N/A'
+        )
 
         right_text = (
             f'{right_distance:.2f}'
@@ -145,9 +167,18 @@ class WallFollower(Node):
         )
 
         self.get_logger().info(
-            f'LEFT={left_distance:.2f} m | '
+            f'LEFT={left_text} m | '
             f'FRONT={front_distance:.2f} m | '
             f'RIGHT={right_text} m'
+        )
+
+        # -------------------------------------------------
+        # WALL STATUS
+        # -------------------------------------------------
+
+        left_wall_lost = (
+            left_distance is None
+            or left_distance > self.left_wall_lost_distance
         )
 
         # -------------------------------------------------
@@ -156,35 +187,44 @@ class WallFollower(Node):
 
         cmd = Twist()
 
-        left_wall_lost = (
-            left_distance is None
-            or left_distance > self.left_wall_lost_distance
-        )
-
+        # =================================================
         # CASE 1:
-        # Front is dangerously close
+        # FRONT DANGEROUSLY CLOSE
+        # Highest priority
+        # =================================================
+
         if front_distance < self.front_stop_distance:
 
             self.get_logger().warn(
-                'Front blocked -> turning right'
+                'Front blocked -> turning RIGHT'
             )
 
             cmd.linear.x = 0.0
             cmd.angular.z = -self.front_turn_speed
 
+
+        # =================================================
         # CASE 2:
-        # Left wall disappeared. Slow down and turn left to find it again.
+        # LEFT WALL LOST
+        # Search for it again
+        # =================================================
+
         elif left_wall_lost:
 
             self.get_logger().warn(
-                'Left wall lost -> slowing and turning left'
+                'Left wall lost -> turning LEFT to reacquire'
             )
 
             cmd.linear.x = self.slow_speed
             cmd.angular.z = self.reacquire_turn_speed
 
+
+        # =================================================
         # CASE 3:
-        # Front is getting close
+        # FRONT GETTING CLOSE
+        # Slow down but continue following wall
+        # =================================================
+
         elif front_distance < self.front_slow_distance:
 
             error = (
@@ -192,7 +232,9 @@ class WallFollower(Node):
                 - left_distance
             )
 
-            angular_correction = -self.kp * error
+            angular_correction = (
+                -self.kp * error
+            )
 
             angular_correction = self.limit(
                 angular_correction,
@@ -201,14 +243,20 @@ class WallFollower(Node):
             )
 
             self.get_logger().info(
-                'Front close -> slowing down'
+                f'Front close -> slow | '
+                f'error={error:.3f} | '
+                f'turn={angular_correction:.3f}'
             )
 
             cmd.linear.x = self.slow_speed
             cmd.angular.z = angular_correction
 
+
+        # =================================================
         # CASE 4:
-        # Normal wall following
+        # NORMAL LEFT-WALL FOLLOWING
+        # =================================================
+
         else:
 
             error = (
@@ -216,7 +264,9 @@ class WallFollower(Node):
                 - left_distance
             )
 
-            angular_correction = -self.kp * error
+            angular_correction = (
+                -self.kp * error
+            )
 
             angular_correction = self.limit(
                 angular_correction,
@@ -224,20 +274,24 @@ class WallFollower(Node):
                 self.max_turn_speed
             )
 
-            cmd.linear.x = self.forward_speed
-            cmd.angular.z = angular_correction
-
             self.get_logger().info(
                 f'Wall follow | '
                 f'error={error:.3f} | '
                 f'turn={angular_correction:.3f}'
             )
 
+            cmd.linear.x = self.forward_speed
+            cmd.angular.z = angular_correction
+
+        # -------------------------------------------------
+        # SEND COMMAND
+        # -------------------------------------------------
+
         self.cmd_vel_publisher.publish(cmd)
 
 
     # =====================================================
-    # GET DISTANCE FROM A LIDAR SECTOR
+    # GET DISTANCE FROM LIDAR SECTOR
     # =====================================================
 
     def get_sector_distance(
@@ -257,7 +311,9 @@ class WallFollower(Node):
                 + i * msg.angle_increment
             )
 
-            angle_deg = math.degrees(angle_rad)
+            angle_deg = (
+                math.degrees(angle_rad) + 180.0
+            ) % 360.0 - 180.0
 
             if (
                 start_angle_deg
@@ -267,7 +323,9 @@ class WallFollower(Node):
 
                 if (
                     math.isfinite(distance)
-                    and msg.range_min <= distance <= msg.range_max
+                    and msg.range_min
+                    <= distance
+                    <= msg.range_max
                 ):
 
                     valid_ranges.append(distance)
@@ -276,12 +334,12 @@ class WallFollower(Node):
             return None
 
         # Front:
-        # nearest obstacle is important
+        # nearest obstacle matters most
         if use_min:
             return min(valid_ranges)
 
         # Side:
-        # median is more stable than one ray
+        # median gives more stable wall measurement
         return statistics.median(valid_ranges)
 
 
@@ -351,11 +409,15 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
 
-    node.stop_robot()
+    finally:
 
-    node.destroy_node()
+        if rclpy.ok():
+            node.stop_robot()
 
-    rclpy.shutdown()
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
