@@ -27,6 +27,13 @@ setup(
             'talkerDemo = create3_pkg.talkerDemo:main',
             'test_bluecolorlight = create3_pkg.test_bluecolorlight:main',
             'test_subproximity_sensor = create3_pkg.test_subproximity_sensor:main',
+            'sensor_reader = create3_pkg.sensor_reader:main',
+            'light_controller = create3_pkg.light_controller:main',
+            'obstacle_light = create3_pkg.obstacle_light:main',
+            'movement_controller = create3_pkg.movement_controller:main',
+            'maze_controller = create3_pkg.maze_controller:main',
+            'wall_perception = create3_pkg.wall_perception:main',
+            'wall_follower = create3_pkg.wall_follower:main',
         ],
     },
 )
