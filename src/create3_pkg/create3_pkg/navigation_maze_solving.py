@@ -2,27 +2,18 @@ import math # ROS uses angles in radians
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-
-def choose_direction(front_distance, left_distance, right_distance):
-
-    safe_distance = 0.5
-
-    if front_distance > safe_distance:
-        decision = "FORWARD"
-    elif left_distance > safe_distance:
-        decision = "LEFT"
-    elif right_distance > safe_distance:
-        decision = "RIGHT"
-    else:
-        decision = "TURN_AROUND"
-
-    return decision
     
 class NavigationNode(Node):
 # Create the navigation node as a ROS 2 Node
 
     def __init__(self):
         super().__init__('navigation_node')
+
+        # Pledge algorithm variables
+        self.mode = "GO_STRAIGHT"
+        self.turn_count = 0
+        self.preferred_heading = None
+        self.previous_heading = None
         
         # Create a subscription to the LiDAR scan topic. The subscription will call the scan_callback function whenever a new LaserScan message is received.
         self.subscription = self.create_subscription(
@@ -32,7 +23,8 @@ class NavigationNode(Node):
             10
         )
 
-    def scan_callback(self, msg): # This function runs automatically whenever a new LiDAR scan is received.
+    def scan_callback(self, msg): 
+        # This function runs automatically whenever a new LiDAR scan is received.
         # msg contains the LaserScan data, including angles and distance measurements. here "msg" is the data from the LiDAR scan
 
         # angle_min is the first angle fromLiDAR measurement 
@@ -52,9 +44,32 @@ class NavigationNode(Node):
         left_distance = msg.ranges[left_index]
         right_distance = msg.ranges[right_index]
 
-        print("Front distance:", front_distance)
-        print("Left distance:", left_distance)
-        print("Right distance:", right_distance)
+        # Pledge: switch to wall-following when the front is blocked
+        if self.mode == "GO_STRAIGHT":
+            if front_distance < 0.5:
+                self.mode = "FOLLOW_WALL"
+                print("Pledge: Wall detected! Starting wall following.")
+            else:
+                decision = "FORWARD"
+                print("Pledge decision:", decision)
+
+        # Decide what to do while following the right wall
+        if self.mode == "FOLLOW_WALL":
+
+            if front_distance < 0.5:
+                decision = "TURN_LEFT"
+
+            elif right_distance > 0.5:
+                decision = "TURN_RIGHT"
+
+            else:
+                decision = "FORWARD"
+
+            print("Pledge decision:", decision)
+
+        # print("Front distance:", front_distance)
+        # print("Left distance:", left_distance)
+        # print("Right distance:", right_distance)
 
 def main(args=None):
     rclpy.init(args=args)
