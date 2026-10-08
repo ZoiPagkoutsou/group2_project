@@ -24,11 +24,12 @@ class WallFollower(Node):
 
         # Forward speeds
         self.forward_speed = 0.08           # normal speed
-        self.slow_speed = 0.04              # when front gets close
+        self.slow_speed = 0.04              # when front gets close or wall is lost
 
         # Safety distances
         self.front_stop_distance = 0.25     # emergency turn
         self.front_slow_distance = 0.45     # start slowing down
+        self.left_wall_lost_distance = 0.60  # wall has disappeared -> reacquire
 
         # P-controller gain
         self.kp = 1.0
@@ -38,6 +39,7 @@ class WallFollower(Node):
 
         # Turning speed when front is blocked
         self.front_turn_speed = 0.50
+        self.reacquire_turn_speed = 0.35     # turn left to find the wall again
 
         # Previous filtered values
         self.filtered_left = None
@@ -101,13 +103,14 @@ class WallFollower(Node):
             use_min=False
         )
 
-        # If important data is missing, stop
-        if left_distance is None or front_distance is None:
+        # Front is the critical safety sensor. If it is missing,
+        # we do not have enough information to drive safely.
+        if front_distance is None:
 
             self.stop_robot()
 
             self.get_logger().warn(
-                'Invalid LiDAR data -> stopping'
+                'Invalid front LiDAR data -> stopping'
             )
 
             return
@@ -116,17 +119,19 @@ class WallFollower(Node):
         # FILTER SENSOR VALUES
         # -------------------------------------------------
 
-        self.filtered_left = self.low_pass_filter(
-            self.filtered_left,
-            left_distance
-        )
+        if left_distance is not None:
+            self.filtered_left = self.low_pass_filter(
+                self.filtered_left,
+                left_distance
+            )
+
+        left_distance = self.filtered_left
 
         self.filtered_front = self.low_pass_filter(
             self.filtered_front,
             front_distance
         )
 
-        left_distance = self.filtered_left
         front_distance = self.filtered_front
 
         # -------------------------------------------------
@@ -151,6 +156,11 @@ class WallFollower(Node):
 
         cmd = Twist()
 
+        left_wall_lost = (
+            left_distance is None
+            or left_distance > self.left_wall_lost_distance
+        )
+
         # CASE 1:
         # Front is dangerously close
         if front_distance < self.front_stop_distance:
@@ -163,6 +173,17 @@ class WallFollower(Node):
             cmd.angular.z = -self.front_turn_speed
 
         # CASE 2:
+        # Left wall disappeared. Slow down and turn left to find it again.
+        elif left_wall_lost:
+
+            self.get_logger().warn(
+                'Left wall lost -> slowing and turning left'
+            )
+
+            cmd.linear.x = self.slow_speed
+            cmd.angular.z = self.reacquire_turn_speed
+
+        # CASE 3:
         # Front is getting close
         elif front_distance < self.front_slow_distance:
 
@@ -186,7 +207,7 @@ class WallFollower(Node):
             cmd.linear.x = self.slow_speed
             cmd.angular.z = angular_correction
 
-        # CASE 3:
+        # CASE 4:
         # Normal wall following
         else:
 
