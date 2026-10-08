@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
-import rclpy
+import math
+import statistics
 
+import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist
-from irobot_create_msgs.msg import IrIntensityVector
+from sensor_msgs.msg import LaserScan
 
 
 class WallFollower(Node):
@@ -14,38 +15,52 @@ class WallFollower(Node):
     def __init__(self):
         super().__init__('wall_follower')
 
-        # -----------------------------
+        # -------------------------------------------------
         # SETTINGS
-        # -----------------------------
+        # -------------------------------------------------
 
-        # These are starting values only.
-        # You must tune them using real sensor readings.
-        self.front_threshold = 700
+        # Desired distance from the left wall
+        self.desired_left_distance = 0.30   # meters
 
-        self.left_too_far = 250
-        self.left_too_close = 900
+        # Forward speeds
+        self.forward_speed = 0.08           # normal speed
+        self.slow_speed = 0.04              # when front gets close
 
-        self.forward_speed = 0.10
-        self.turn_speed = 0.35
-        self.correction_speed = 0.18
+        # Safety distances
+        self.front_stop_distance = 0.25     # emergency turn
+        self.front_slow_distance = 0.45     # start slowing down
 
-        # -----------------------------
-        # SENSOR SUBSCRIBER
-        # -----------------------------
+        # P-controller gain
+        self.kp = 1.0
 
-        self.ir_subscriber = self.create_subscription(
-            IrIntensityVector,
-            '/robot_8/ir_intensity',
-            self.ir_callback,
-            QoSProfile(
-                depth=10,
-                reliability=ReliabilityPolicy.BEST_EFFORT
-            )
+        # Maximum turning speed
+        self.max_turn_speed = 0.45
+
+        # Turning speed when front is blocked
+        self.front_turn_speed = 0.50
+
+        # Previous filtered values
+        self.filtered_left = None
+        self.filtered_front = None
+
+        # Smoothing factor
+        # Larger alpha = more weight on old value
+        self.alpha = 0.7
+
+        # -------------------------------------------------
+        # LIDAR SUBSCRIBER
+        # -------------------------------------------------
+
+        self.scan_subscriber = self.create_subscription(
+            LaserScan,
+            '/robot_8/scan',
+            self.scan_callback,
+            10
         )
 
-        # -----------------------------
-        # VELOCITY PUBLISHER
-        # -----------------------------
+        # -------------------------------------------------
+        # CMD_VEL PUBLISHER
+        # -------------------------------------------------
 
         self.cmd_vel_publisher = self.create_publisher(
             Twist,
@@ -54,110 +69,254 @@ class WallFollower(Node):
         )
 
         self.get_logger().info(
-            'Left wall follower started'
+            'LiDAR wall follower started'
         )
 
 
-    def ir_callback(self, msg):
+    # =====================================================
+    # LIDAR CALLBACK
+    # =====================================================
 
-        values = [
-            reading.value
-            for reading in msg.readings
-        ]
+    def scan_callback(self, msg):
 
-        if len(values) != 7:
+        # Get distances from useful sectors
+        left_distance = self.get_sector_distance(
+            msg,
+            75,
+            105,
+            use_min=False
+        )
+
+        front_distance = self.get_sector_distance(
+            msg,
+            -15,
+            15,
+            use_min=True
+        )
+
+        right_distance = self.get_sector_distance(
+            msg,
+            -105,
+            -75,
+            use_min=False
+        )
+
+        # If important data is missing, stop
+        if left_distance is None or front_distance is None:
+
+            self.stop_robot()
+
+            self.get_logger().warn(
+                'Invalid LiDAR data -> stopping'
+            )
+
             return
 
-        # Sensor positions
-        side_left = values[0]
-        left = values[1]
+        # -------------------------------------------------
+        # FILTER SENSOR VALUES
+        # -------------------------------------------------
 
-        front_left = values[2]
-        front_center_left = values[3]
-        front_center_right = values[4]
-        front_right = values[5]
-
-        right = values[6]
-
-        # -----------------------------
-        # PERCEPTION
-        # -----------------------------
-
-        left_wall = max(
-            side_left,
-            left
+        self.filtered_left = self.low_pass_filter(
+            self.filtered_left,
+            left_distance
         )
 
-        front = max(
-            front_left,
-            front_center_left,
-            front_center_right,
-            front_right
+        self.filtered_front = self.low_pass_filter(
+            self.filtered_front,
+            front_distance
         )
 
-        right_wall = max(
-            front_right,
-            right
+        left_distance = self.filtered_left
+        front_distance = self.filtered_front
+
+        # -------------------------------------------------
+        # PRINT PERCEPTION
+        # -------------------------------------------------
+
+        right_text = (
+            f'{right_distance:.2f}'
+            if right_distance is not None
+            else 'N/A'
         )
 
         self.get_logger().info(
-            f'LEFT={left_wall} | '
-            f'FRONT={front} | '
-            f'RIGHT={right_wall}'
+            f'LEFT={left_distance:.2f} m | '
+            f'FRONT={front_distance:.2f} m | '
+            f'RIGHT={right_text} m'
         )
 
-        # -----------------------------
-        # DECISION
-        # -----------------------------
+        # -------------------------------------------------
+        # CONTROL
+        # -------------------------------------------------
 
         cmd = Twist()
 
         # CASE 1:
-        # Obstacle in front
-        if front > self.front_threshold:
+        # Front is dangerously close
+        if front_distance < self.front_stop_distance:
 
-            self.get_logger().info(
-                'Front blocked -> turn right'
+            self.get_logger().warn(
+                'Front blocked -> turning right'
             )
 
             cmd.linear.x = 0.0
-            cmd.angular.z = -self.turn_speed
+            cmd.angular.z = -self.front_turn_speed
 
         # CASE 2:
-        # Left wall is too far away
-        elif left_wall < self.left_too_far:
+        # Front is getting close
+        elif front_distance < self.front_slow_distance:
 
-            self.get_logger().info(
-                'Wall too far -> steer left'
+            error = (
+                self.desired_left_distance
+                - left_distance
             )
 
-            cmd.linear.x = self.forward_speed
-            cmd.angular.z = self.correction_speed
+            angular_correction = -self.kp * error
+
+            angular_correction = self.limit(
+                angular_correction,
+                -self.max_turn_speed,
+                self.max_turn_speed
+            )
+
+            self.get_logger().info(
+                'Front close -> slowing down'
+            )
+
+            cmd.linear.x = self.slow_speed
+            cmd.angular.z = angular_correction
 
         # CASE 3:
-        # Left wall is too close
-        elif left_wall > self.left_too_close:
-
-            self.get_logger().info(
-                'Wall too close -> steer right'
-            )
-
-            cmd.linear.x = self.forward_speed
-            cmd.angular.z = -self.correction_speed
-
-        # CASE 4:
-        # Good wall distance
+        # Normal wall following
         else:
 
-            self.get_logger().info(
-                'Wall distance good -> forward'
+            error = (
+                self.desired_left_distance
+                - left_distance
+            )
+
+            angular_correction = -self.kp * error
+
+            angular_correction = self.limit(
+                angular_correction,
+                -self.max_turn_speed,
+                self.max_turn_speed
             )
 
             cmd.linear.x = self.forward_speed
-            cmd.angular.z = 0.0
+            cmd.angular.z = angular_correction
+
+            self.get_logger().info(
+                f'Wall follow | '
+                f'error={error:.3f} | '
+                f'turn={angular_correction:.3f}'
+            )
 
         self.cmd_vel_publisher.publish(cmd)
 
+
+    # =====================================================
+    # GET DISTANCE FROM A LIDAR SECTOR
+    # =====================================================
+
+    def get_sector_distance(
+        self,
+        msg,
+        start_angle_deg,
+        end_angle_deg,
+        use_min=False
+    ):
+
+        valid_ranges = []
+
+        for i, distance in enumerate(msg.ranges):
+
+            angle_rad = (
+                msg.angle_min
+                + i * msg.angle_increment
+            )
+
+            angle_deg = math.degrees(angle_rad)
+
+            if (
+                start_angle_deg
+                <= angle_deg
+                <= end_angle_deg
+            ):
+
+                if (
+                    math.isfinite(distance)
+                    and msg.range_min <= distance <= msg.range_max
+                ):
+
+                    valid_ranges.append(distance)
+
+        if len(valid_ranges) == 0:
+            return None
+
+        # Front:
+        # nearest obstacle is important
+        if use_min:
+            return min(valid_ranges)
+
+        # Side:
+        # median is more stable than one ray
+        return statistics.median(valid_ranges)
+
+
+    # =====================================================
+    # LOW-PASS FILTER
+    # =====================================================
+
+    def low_pass_filter(
+        self,
+        previous_value,
+        new_value
+    ):
+
+        if previous_value is None:
+            return new_value
+
+        return (
+            self.alpha * previous_value
+            + (1.0 - self.alpha) * new_value
+        )
+
+
+    # =====================================================
+    # LIMIT VALUE
+    # =====================================================
+
+    def limit(
+        self,
+        value,
+        minimum,
+        maximum
+    ):
+
+        return max(
+            minimum,
+            min(maximum, value)
+        )
+
+
+    # =====================================================
+    # STOP ROBOT
+    # =====================================================
+
+    def stop_robot(self):
+
+        cmd = Twist()
+
+        cmd.linear.x = 0.0
+        cmd.angular.z = 0.0
+
+        self.cmd_vel_publisher.publish(cmd)
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main(args=None):
 
@@ -169,13 +328,9 @@ def main(args=None):
         rclpy.spin(node)
 
     except KeyboardInterrupt:
+        pass
 
-        # Stop robot when Ctrl+C is pressed
-        stop_cmd = Twist()
-
-        node.cmd_vel_publisher.publish(
-            stop_cmd
-        )
+    node.stop_robot()
 
     node.destroy_node()
 
