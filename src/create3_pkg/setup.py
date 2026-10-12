@@ -37,6 +37,9 @@ setup(
             'wall_follower = create3_pkg.wall_follower:main',
             'lidar_reader = create3_pkg.lidar_reader:main',
             'wall_follower_v1 = create3_pkg.wall_follower_v1:main',
+            'wall_follower_v2 = create3_pkg.wall_follower_v2:main',
+            'wall_follower_fsm = create3_pkg.wall_follower_fsm:main',
+            'wall_follower_simple = create3_pkg.wall_follower_simple:main',
         ],
     },
 )
