@@ -40,6 +40,8 @@ setup(
             'wall_follower_v2 = create3_pkg.wall_follower_v2:main',
             'wall_follower_fsm = create3_pkg.wall_follower_fsm:main',
             'wall_follower_simple = create3_pkg.wall_follower_simple:main',
+            'wall_follower_node = create3_pkg.wall_follower_node:main',
+            'lidar_check = create3_pkg.lidar_check:main',
         ],
     },
 )
