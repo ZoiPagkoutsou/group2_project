@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple See -> Think -> Act wall follower with three FSM states."""
+"""See -> Think -> Act wall follower with sensor-guided corner recovery."""
 
 import math
 import statistics
@@ -38,11 +38,12 @@ CURVE_SPEED = 0.0        # In-place left turn; increase only after calibration.
 TURN_SPEED = 1.50
 TURN_FINISH_SPEED = 0.50
 TURN_SLOW_ANGLE_DEGREES = 15.0
-# Scale the previous 0.06 m/s steering calibration with forward speed.
-STEERING_SPEED_SCALE = FORWARD_SPEED / 0.06
-K_DISTANCE = 1.0 * STEERING_SPEED_SCALE
-K_ANGLE = 0.5 * STEERING_SPEED_SCALE
-MAX_CORRECTION = min(TURN_SPEED, 0.30 * STEERING_SPEED_SCALE)
+# Heading error is measured in radians; avoid scaling gains with cruise speed.
+K_DISTANCE = 1.0
+K_ANGLE = 1.5
+MAX_CORRECTION = 0.60
+WALL_ALIGNED_ANGLE = math.radians(10.0)
+WALL_DISTANCE_TOLERANCE = 0.05
 
 SECTOR_HALF_WIDTH = 10.0  # Each conceptual direction covers +/-10 degrees.
 MIN_VALID_READINGS = 3
@@ -63,8 +64,18 @@ FRONT_LEFT_OPEN_DISTANCE = SLOW_DIAGONAL_DISTANCE
 LEFT_WALL_SEEN_DISTANCE = DESIRED_DISTANCE + 0.05
 WALL_FOLLOW_MAX_DISTANCE = CORRIDOR_WIDTH + 0.10
 LEFT_OPEN_PERSISTENCE = 0.30
-CORNER_CLEARANCE_DISTANCE = 0.15  # Empirical advance after detecting an opening.
+CORNER_CLEARANCE_DISTANCE = 0.15  # Maximum advance, not a fixed turn delay.
 CORNER_CLEARANCE_TIME = CORNER_CLEARANCE_DISTANCE / SLOW_SPEED
+CORNER_BACK_CLEARANCE = math.hypot(
+    DESIRED_DISTANCE, ROBOT_RADIUS + SAFETY_CLEARANCE)
+MIN_LEFT_TURN_ANGLE = math.radians(60.0)
+WALL_CONFIRM_TIME = 0.20
+REACQUIRE_SPEED = 0.06
+REACQUIRE_TURN_SPEED = 0.35
+REACQUIRE_MAX_ANGLE = math.radians(45.0)
+REACQUIRE_TIMEOUT = 8.0
+LEFT_RETRY_DELAY = 3.0
+CONTROLLER_REVISION = 'small-wall-recovery-3'
 
 TURN_ANGLE_DEGREES = 90.0
 TURN_TOLERANCE_DEGREES = 3.0
@@ -84,6 +95,7 @@ class WallFollower(Node):
     FOLLOW_WALL = 'FOLLOW_WALL'
     TURN_RIGHT = 'TURN_RIGHT'
     TURN_LEFT = 'TURN_LEFT'
+    REACQUIRE_WALL = 'REACQUIRE_WALL'
 
     def __init__(self):
         super().__init__('wall_follower')
@@ -105,6 +117,9 @@ class WallFollower(Node):
         self.corner_clearance_time = CORNER_CLEARANCE_TIME
         self.turn_start_yaw = None
         self.turn_progress = 0.0
+        self.wall_aligned_since = None
+        self.left_retry_after = 0.0
+        self.turn_target_angle = math.radians(TURN_ANGLE_DEGREES)
         self.fault = None
         self.wait_reason = None
 
@@ -126,7 +141,8 @@ class WallFollower(Node):
         # A timer still stops the robot when scan callbacks stop arriving.
         self.control_timer = self.create_timer(CONTROL_PERIOD, self.control_robot)
         self.get_logger().info(
-            f'8-sector FSM started: scan={SCAN_TOPIC}, odom={ODOM_TOPIC}; '
+            f'8-sector FSM started [{CONTROLLER_REVISION}]: '
+            f'scan={SCAN_TOPIC}, odom={ODOM_TOPIC}; '
             f'sectors=+/-{SECTOR_HALF_WIDTH:.0f} deg, '
             f'wall distance={DESIRED_DISTANCE:.2f} m')
         self.get_logger().info(
@@ -188,7 +204,7 @@ class WallFollower(Node):
         self.last_odom_time = self.now()
 
     # =========================================================
-    # THINK: only FOLLOW_WALL, TURN_RIGHT and TURN_LEFT
+    # THINK: follow, clear/turn, then reacquire the wall
     # =========================================================
     def control_robot(self):
         now = self.now()
@@ -224,12 +240,12 @@ class WallFollower(Node):
                 self.start_manoeuvre(self.TURN_RIGHT, 'Front safety distance reached', now)
                 return
 
-            left_median, _ = self.sectors['left']
-            if left_median is not None and left_median < LEFT_WALL_SEEN_DISTANCE:
+            _, left_near = self.sectors['left']
+            if left_near is not None and left_near < LEFT_WALL_SEEN_DISTANCE:
                 self.left_wall_seen = True
 
             left_open = self.left_opening()
-            if self.left_wall_seen and left_open:
+            if self.left_wall_seen and left_open and now >= self.left_retry_after:
                 if self.open_since is None:
                     self.open_since = now
                 if now - self.open_since >= LEFT_OPEN_PERSISTENCE:
@@ -251,9 +267,12 @@ class WallFollower(Node):
             self.follow_left_wall()
             return
 
-        # Both turning states need fresh odometry and have a time limit.
+        # Recovery also needs odometry so searching cannot continue indefinitely.
         if not self.is_fresh(self.last_odom_time, ODOM_TIMEOUT, now):
             self.fail('Odometry stale during manoeuvre')
+            return
+        if self.state == self.REACQUIRE_WALL:
+            self.reacquire_wall(now)
             return
         if now - self.state_start_time >= MANOEUVRE_TIMEOUT:
             self.fail('Manoeuvre timeout: required yaw change not reached')
@@ -262,11 +281,19 @@ class WallFollower(Node):
         if self.state == self.TURN_LEFT:
             # Check all three front sectors throughout clearance and rotation.
             if self.front_blocked(FRONT_SAFETY_DISTANCE):
-                self.fail('Front area blocked during left manoeuvre')
+                self.cancel_left_attempt('Front area blocked during left manoeuvre', now)
                 return
-            if now - self.state_start_time < self.corner_clearance_time:
-                self.act(SLOW_SPEED, 0.0)
-                return
+            if self.turn_start_yaw is None and not self.corner_clear():
+                if (now - self.state_start_time >= self.corner_clearance_time
+                        or self.sectors['front'][1] <= FRONT_BLOCKED):
+                    if not self.rotation_clear():
+                        self.cancel_left_attempt('Wall edge clearance unavailable', now)
+                        return
+                    # A rear wall can remain visible in a narrow corridor even
+                    # when there is space for an in-place rotation.
+                else:
+                    self.act(SLOW_SPEED, 0.0)
+                    return
 
         if self.turn_start_yaw is None:
             self.turn_start_yaw = self.yaw
@@ -276,20 +303,30 @@ class WallFollower(Node):
                 f'{math.degrees(self.yaw):.1f} deg')
 
         direction = 1.0 if self.state == self.TURN_LEFT else -1.0
-        target = math.radians(TURN_ANGLE_DEGREES - TURN_TOLERANCE_DEGREES)
-        if direction * self.turn_progress >= target:
+        target = max(0.0, self.turn_target_angle - math.radians(TURN_TOLERANCE_DEGREES))
+        wall_aligned = (direction > 0.0
+                        and self.turn_progress >= MIN_LEFT_TURN_ANGLE
+                        and self.wall_alignment_confirmed(now))
+        if wall_aligned or direction * self.turn_progress >= target:
             self.act(0.0, 0.0)
             self.left_wall_seen = False
             self.turn_start_yaw = None
             self.open_since = None
-            self.change_state(self.FOLLOW_WALL, 'Turn complete', now)
+            self.wall_aligned_since = None
+            if direction < 0.0:
+                # A dead end can require another right turn. Recheck the front
+                # before trying to align with a wall or searching back left.
+                self.change_state(self.FOLLOW_WALL, 'Right turn complete; recheck exit', now)
+            else:
+                self.change_state(self.REACQUIRE_WALL, 'Turn complete; find left wall', now)
             return
 
         linear = self.forward_speed(CURVE_SPEED) if direction > 0.0 else 0.0
         # Rotate quickly, then slow near the target to reduce overshoot.
-        remaining = math.radians(TURN_ANGLE_DEGREES) - direction * self.turn_progress
+        remaining = self.turn_target_angle - direction * self.turn_progress
         angular_speed = TURN_SPEED
-        if remaining <= math.radians(TURN_SLOW_ANGLE_DEGREES):
+        if (remaining <= math.radians(TURN_SLOW_ANGLE_DEGREES)
+                or self.wall_aligned_since is not None):
             angular_speed = TURN_FINISH_SPEED
         self.act(linear, direction * angular_speed)
 
@@ -300,6 +337,8 @@ class WallFollower(Node):
             return
         self.turn_start_yaw = None
         self.turn_progress = 0.0
+        self.turn_target_angle = math.radians(TURN_ANGLE_DEGREES)
+        self.wall_aligned_since = None
         self.open_since = None
         self.corner_clearance_time = CORNER_CLEARANCE_TIME
         if state == self.TURN_LEFT:
@@ -310,6 +349,120 @@ class WallFollower(Node):
                 CORNER_CLEARANCE_TIME, available_forward / SLOW_SPEED)
             reason += f' (forward clearance {self.corner_clearance_time:.2f} s)'
         self.change_state(state, reason, now)
+
+    def rotation_clear(self):
+        clearance = max(ROBOT_RADIUS, LIDAR_TO_FRONT) + SAFETY_CLEARANCE
+        return all(near is not None and near > clearance
+                   for _, near in self.sectors.values())
+
+    def cancel_left_attempt(self, reason, now):
+        # Undo a partial turn; if rotation never began, choose a right exit.
+        undo_angle = max(0.0, self.turn_progress)
+        rotating = self.turn_start_yaw is not None
+        self.left_retry_after = now + LEFT_RETRY_DELAY
+        self.start_manoeuvre(self.TURN_RIGHT, reason + '; cancel left attempt', now)
+        if rotating and undo_angle > math.radians(TURN_TOLERANCE_DEGREES):
+            self.turn_target_angle = undo_angle
+
+    def corner_clear(self):
+        # At the normal side offset, a receding rear diagonal indicates that
+        # the edge is behind the body. Unknown readings never confirm clearance.
+        left_near = self.sectors['left'][1]
+        back_near = self.sectors['back_left'][1]
+        return (left_near is not None and back_near is not None
+                and left_near > ROBOT_RADIUS + SAFETY_CLEARANCE
+                and back_near > CORNER_BACK_CLEARANCE)
+
+    def wall_geometry(self):
+        # A short wall may occupy fewer than half the rays in a sector.
+        # Its nearby returns still provide a wall reference.
+        left = self.sectors['left'][1]
+        front_left = self.sectors['front_left'][1]
+        if (left is None or front_left is None
+                or left >= WALL_FOLLOW_MAX_DISTANCE
+                or front_left >= WALL_FOLLOW_MAX_DISTANCE):
+            return None
+        diagonal = front_left * math.sqrt(0.5)
+        heading = math.atan2(diagonal - left, diagonal)
+        return left * math.cos(heading), heading
+
+    def wall_alignment_confirmed(self, now):
+        geometry = self.wall_geometry()
+        aligned = (geometry is not None
+                   and abs(geometry[1]) <= WALL_ALIGNED_ANGLE
+                   and abs(geometry[0] - DESIRED_DISTANCE)
+                   <= WALL_DISTANCE_TOLERANCE)
+        if not aligned:
+            self.wall_aligned_since = None
+            return False
+        if self.wall_aligned_since is None:
+            self.wall_aligned_since = now
+        return now - self.wall_aligned_since >= WALL_CONFIRM_TIME
+
+    def reacquire_wall(self, now):
+        # A blocked passage is a navigation decision, not a sensor fault.
+        # Handle it before search limits so a dead end can be exited normally.
+        if self.right_turn_needed():
+            self.start_manoeuvre(
+                self.TURN_RIGHT, 'Front blocked during wall search; turn toward exit', now)
+            return
+        left_near = self.sectors['left'][1]
+        if (left_near is not None and left_near < WALL_FOLLOW_MAX_DISTANCE
+                and left_near > ROBOT_RADIUS + SAFETY_CLEARANCE):
+            # Finding a wall is enough to hand over to the tracking controller.
+            # Requiring perfect alignment here made short walls disappear again
+            # during repeated in-place corrections.
+            self.left_wall_seen = True
+            self.turn_start_yaw = None
+            self.open_since = None
+            self.wall_aligned_since = None
+            self.act(0.0, 0.0)
+            self.change_state(self.FOLLOW_WALL, 'Nearby left wall acquired; track slowly', now)
+            return
+        if now - self.state_start_time >= REACQUIRE_TIMEOUT:
+            self.left_retry_after = now + LEFT_RETRY_DELAY
+            self.start_manoeuvre(self.TURN_RIGHT, 'Wall search timeout; recheck exit', now)
+            return
+        if self.turn_start_yaw is None:
+            self.turn_start_yaw = self.yaw
+            self.turn_progress = 0.0
+        if abs(self.turn_progress) >= REACQUIRE_MAX_ANGLE:
+            self.left_retry_after = now + LEFT_RETRY_DELAY
+            self.start_manoeuvre(self.TURN_RIGHT, 'Wall search limit; recheck exit', now)
+            return
+        if self.wall_alignment_confirmed(now):
+            self.left_wall_seen = True
+            self.turn_start_yaw = None
+            self.open_since = None
+            self.act(0.0, 0.0)
+            self.change_state(self.FOLLOW_WALL, 'Left wall reacquired and aligned', now)
+            return
+        if self.sectors['left'][1] is None:
+            self.wait('Waiting for valid left sector during wall search')
+            return
+        if self.sectors['front_left'][1] < FRONT_LEFT_BLOCKED:
+            self.act(0.0, -MAX_CORRECTION)
+        elif self.sectors['front_right'][1] < FRONT_RIGHT_BLOCKED:
+            self.act(0.0, MAX_CORRECTION)
+        elif self.sectors['left'][1] < ROBOT_RADIUS + SAFETY_CLEARANCE:
+            self.act(0.0, -MAX_CORRECTION)
+        elif self.wall_geometry() is not None:
+            self.follow_left_wall(reacquiring=True)
+        elif (self.sectors['front_left'][1] < WALL_FOLLOW_MAX_DISTANCE
+              and self.sectors['left'][1] >= WALL_FOLLOW_MAX_DISTANCE):
+            # Keep clearance from a visible edge even if no wall spans the
+            # left sector yet. A zero-steering approach runs into short walls.
+            projected_clearance = self.sectors['front_left'][1] * math.sqrt(0.5)
+            correction = K_DISTANCE * (projected_clearance - DESIRED_DISTANCE)
+            correction = max(-REACQUIRE_TURN_SPEED,
+                             min(REACQUIRE_TURN_SPEED, correction))
+            self.act(REACQUIRE_SPEED, correction)
+        else:
+            # Actively look left instead of driving straight past a thin wall.
+            speed = REACQUIRE_SPEED
+            if self.sectors['front'][1] < FRONT_BLOCKED:
+                speed = 0.0
+            self.act(speed, REACQUIRE_TURN_SPEED)
 
     def right_turn_needed(self):
         # One close diagonal is often the side wall, not a dead end.
@@ -346,27 +499,43 @@ class WallFollower(Node):
             or self.sectors['front_right'][1] < SLOW_DIAGONAL_DISTANCE)
         return min(normal_speed, SLOW_SPEED) if approaching else normal_speed
 
-    def follow_left_wall(self, opening_pending=False):
-        left, _ = self.sectors['left']
-        front_left, _ = self.sectors['front_left']
-        back_left, _ = self.sectors['back_left']
+    def follow_left_wall(self, opening_pending=False, reacquiring=False):
+        _, left = self.sectors['left']
+        _, front_left = self.sectors['front_left']
+        _, back_left = self.sectors['back_left']
         steering = 0.0
+        aligned = False
         # After a turn, gently approach a visible wall even if it is farther
         # than the opening threshold. Do not steer across a pending opening.
         if (not opening_pending and left is not None
                 and left < WALL_FOLLOW_MAX_DISTANCE):
-            distance_error = left - DESIRED_DISTANCE
             angle_error = 0.0
-            # While finding a new wall, use distance only. Distant diagonals
-            # may see different walls and pull the robot away from that wall.
-            if (self.left_wall_seen
-                    and front_left is not None and back_left is not None
-                    and front_left < WALL_FOLLOW_MAX_DISTANCE
+            # Two rays estimate the wall heading even immediately after a turn.
+            # Prefer the wall ahead; the rear ray may still see the old corridor.
+            diagonal = math.sqrt(0.5)
+            heading_known = False
+            if (front_left is not None
+                    and front_left < WALL_FOLLOW_MAX_DISTANCE):
+                angle_error = math.atan2(
+                    front_left * diagonal - left, front_left * diagonal)
+                heading_known = True
+            elif (back_left is not None
                     and back_left < WALL_FOLLOW_MAX_DISTANCE):
-                angle_error = front_left - back_left
+                angle_error = math.atan2(
+                    left - back_left * diagonal, back_left * diagonal)
+                heading_known = True
+            distance_error = left * math.cos(angle_error) - DESIRED_DISTANCE
             steering = K_DISTANCE * distance_error + K_ANGLE * angle_error
             steering = max(-MAX_CORRECTION, min(MAX_CORRECTION, steering))
-        normal_speed = SLOW_SPEED if opening_pending or not self.left_wall_seen else FORWARD_SPEED
+            aligned = (heading_known
+                       and abs(angle_error) <= WALL_ALIGNED_ANGLE
+                       and abs(distance_error) <= WALL_DISTANCE_TOLERANCE
+                       and self.sectors['left'][0] is not None
+                       and abs(self.sectors['left'][0] - left)
+                       <= WALL_DISTANCE_TOLERANCE)
+        normal_speed = FORWARD_SPEED if aligned and not opening_pending else SLOW_SPEED
+        if reacquiring:
+            normal_speed = REACQUIRE_SPEED
         speed = self.forward_speed(normal_speed)
         # Correct a close side wall within FOLLOW_WALL instead of turning 90 deg.
         # Pause forward movement while steering away from a very close diagonal.
@@ -376,6 +545,9 @@ class WallFollower(Node):
         elif self.sectors['front_right'][1] < FRONT_RIGHT_BLOCKED:
             speed = 0.0
             steering = MAX_CORRECTION
+        elif left is not None and left < ROBOT_RADIUS + SAFETY_CLEARANCE:
+            speed = 0.0
+            steering = -REACQUIRE_TURN_SPEED
         self.wait_reason = None
         self.act(speed, steering)
 
@@ -397,7 +569,7 @@ class WallFollower(Node):
             self.wait_reason = reason
 
     def fail(self, reason):
-        # Keep the three FSM states; a fault simply inhibits all motion.
+        # A fault inhibits all motion until the node is restarted.
         # Restart after inspecting a manoeuvre fault, rather than retry blindly.
         self.fault = reason
         self.act(0.0, 0.0)
