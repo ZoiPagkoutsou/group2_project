@@ -3,7 +3,9 @@
 Keeping this module free of ROS makes it easy to unit-test offline with
 recorded or synthetic scans.
 
-Angle convention (ROS REP-103, robot frame):
+All distances and angles are measured from the ROBOT CENTRE, not from the
+LiDAR (the LiDAR position is given in ScanConfig). Angle convention
+(ROS REP-103, robot frame):
     0 rad   = robot front
     +pi/2   = robot left
     -pi/2   = robot right
@@ -45,13 +47,21 @@ class ScanConfig:
     """How the LiDAR is mounted relative to the robot."""
 
     # Rotation added to every scan angle so that 0 rad points to the robot front.
-    # Find it once by putting an object in front of the robot (see README).
+    # Find it once by putting an object in front of the robot (see lidar_check).
     angle_offset: float = 0.0
     # True if the LiDAR reports angles clockwise (e.g. mounted upside down).
     reversed: bool = False
-    # Readings outside [min_valid_range, max_valid_range] are ignored (metres).
+    # LiDAR position relative to the robot centre (m, +x = forward).
+    # Create 3: 35 cm body, LiDAR 20 cm behind the front edge -> 0.175 - 0.20.
+    lidar_x: float = -0.025
+    # Readings outside [min_valid_range, max_valid_range] are ignored (metres,
+    # measured from the LiDAR).
     min_valid_range: float = 0.05
     max_valid_range: float = 8.0
+    # Parts of the robot the LiDAR sees (cables, brackets): readings closer
+    # than max_range between two RAW LiDAR angles (rad, as in the LaserScan,
+    # before angle_offset/reversed) are ignored. ((from, to, max_range), ...)
+    ignore_sectors: tuple = ()
     # Half-width of the angular window used to compute a robust distance (rad).
     sector_half_width: float = math.radians(8.0)
     # Each beam is replaced by the median of this many neighbouring beams
@@ -62,38 +72,46 @@ class ScanConfig:
 
 
 class LidarProcessor:
-    """Converts a raw LaserScan into robust distances in robot-frame directions."""
+    """Converts a raw LaserScan into obstacle points around the robot centre."""
 
     def __init__(self, config: ScanConfig):
         self.config = config
-        self._angles = np.empty(0)  # robot-frame angle of each valid reading
-        self._ranges = np.empty(0)  # range of each valid reading
+        self._x = np.empty(0)       # robot-frame point coordinates (m)
+        self._y = np.empty(0)
+        self._angles = np.empty(0)  # bearing of each point from the centre
+        self._ranges = np.empty(0)  # distance of each point from the centre
 
     def update(self, ranges, angle_min, angle_increment,
                range_min=0.0, range_max=float('inf')):
         """Store a new scan. Arguments mirror sensor_msgs/LaserScan fields."""
         ranges = np.asarray(ranges, dtype=float)
-        raw_angles = angle_min + angle_increment * np.arange(ranges.size)
-        if self.config.reversed:
-            raw_angles = -raw_angles
-        angles = wrap_angle(raw_angles + self.config.angle_offset)
+        raw_angles = wrap_angle(angle_min + angle_increment * np.arange(ranges.size))
+        angles = -raw_angles if self.config.reversed else raw_angles
+        angles = wrap_angle(angles + self.config.angle_offset)
 
         lo = max(range_min, self.config.min_valid_range)
         hi = min(range_max, self.config.max_valid_range)
         valid = np.isfinite(ranges) & (ranges >= lo) & (ranges <= hi)
+        for start, end, max_range in self.config.ignore_sectors:
+            start, end = sorted((start, end))
+            valid &= ~((raw_angles >= start) & (raw_angles <= end)
+                       & (ranges < max_range))
         ranges = np.where(valid, ranges, np.nan)
         ranges = circular_median_filter(ranges, self.config.median_filter_size)
         valid = np.isfinite(ranges)
 
-        self._angles = angles[valid]
-        self._ranges = ranges[valid]
+        # Shift the points from the LiDAR to the robot centre.
+        self._x = self.config.lidar_x + ranges[valid] * np.cos(angles[valid])
+        self._y = ranges[valid] * np.sin(angles[valid])
+        self._angles = np.arctan2(self._y, self._x)
+        self._ranges = np.hypot(self._x, self._y)
 
     @property
     def has_data(self):
         return self._ranges.size > 0
 
     def distance_at(self, angle, half_width=None):
-        """Median range inside a window around `angle` (robot frame).
+        """Median distance inside a window around `angle` (robot frame).
 
         The median rejects single noisy readings. Returns inf when there is
         no valid reading in the window (open space or out of range).
@@ -108,54 +126,43 @@ class LidarProcessor:
 
     def min_distance_in(self, angle_from, angle_to):
         """Closest valid reading between two robot-frame angles (inclusive)."""
-        lo, hi = sorted((angle_from, angle_to))
-        mask = (self._angles >= lo) & (self._angles <= hi)
+        mask = self._sector_mask(angle_from, angle_to)
         if not np.any(mask):
             return float('inf')
         return float(np.min(self._ranges[mask]))
 
+    def nearest_point(self, angle_from, angle_to, max_distance=float('inf')):
+        """(distance, bearing) of the closest point in a sector, or None."""
+        mask = self._sector_mask(angle_from, angle_to) & (self._ranges <= max_distance)
+        if not np.any(mask):
+            return None
+        i = np.argmin(np.where(mask, self._ranges, np.inf))
+        return float(self._ranges[i]), float(self._angles[i])
 
-@dataclass
-class WallEstimate:
-    """Geometry of the wall on one side of the robot."""
+    def free_distance_ahead(self, half_width):
+        """How far the robot can drive straight before an obstacle enters a
+        circle of radius `half_width` around its centre.
 
-    distance: float  # perpendicular distance robot -> wall (m)
-    angle: float     # rad; > 0 means the robot is heading INTO the wall
-    valid: bool
-    ends_ahead: bool = False  # the wall stops a little ahead (corner coming)
+        This is the swept path of a round robot: only points ahead of the
+        centre with |y| < half_width can be hit. Negative = already too close.
+        """
+        mask = (self._x > 0.0) & (np.abs(self._y) < half_width)
+        if not np.any(mask):
+            return float('inf')
+        x, y = self._x[mask], self._y[mask]
+        return float(np.min(x - np.sqrt(half_width ** 2 - y ** 2)))
 
-
-def estimate_wall(processor: LidarProcessor, side: int, beam_angle: float,
-                  max_distance: float = float('inf')):
-    """Estimate distance and relative angle of the wall on one side.
-
-    Uses two beams: one perpendicular to the robot (b) and one rotated
-    `beam_angle` towards the front (a). With both points on the wall line:
-
-        psi = atan2(b - a*cos(theta), a*sin(theta))
-        D   = b * cos(psi)
-
-    The wall counts as present while the perpendicular beam b sees it
-    (b < max_distance). If beam a already looks past the end of the wall
-    (an opening ahead), the angle is unknown and set to 0 so the robot keeps
-    going straight instead of cutting the corner.
-
-    side: +1 = left wall, -1 = right wall.
-    """
-    b = processor.distance_at(side * math.pi / 2.0)
-    a = processor.distance_at(side * (math.pi / 2.0 - beam_angle))
-    if not (math.isfinite(b) and b < max_distance):
-        return WallEstimate(distance=b, angle=0.0, valid=False)
-    a_on_wall = math.isfinite(a) and a * math.cos(beam_angle) < max_distance
-    if not a_on_wall:
-        return WallEstimate(distance=b, angle=0.0, valid=True, ends_ahead=True)
-    psi = math.atan2(b - a * math.cos(beam_angle), a * math.sin(beam_angle))
-    return WallEstimate(distance=b * math.cos(psi), angle=psi, valid=True)
+    def _sector_mask(self, angle_from, angle_to):
+        lo, hi = sorted((angle_from, angle_to))
+        return (self._angles >= lo) & (self._angles <= hi)
 
 
 @dataclass
 class Surroundings:
-    """Perception summary that the navigation node can use."""
+    """Perception summary that the navigation node can use.
+
+    Distances are from the robot centre.
+    """
 
     front: float
     left: float

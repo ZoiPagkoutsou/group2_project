@@ -6,7 +6,8 @@ Subscribes
 Publishes
     <cmd_vel_topic>   geometry_msgs/Twist     (default /robot_8/cmd_vel)
     ~/distances       std_msgs/Float32MultiArray
-                      [front, left, right, front_left, front_right] in metres
+                      [front, left, right, front_left, front_right] in metres,
+                      measured from the robot centre
     ~/situation       std_msgs/String  corridor | corner_left | corner_right |
                                        junction | dead_end
     ~/state           std_msgs/String  controller state (FOLLOW_WALL, ...)
@@ -20,6 +21,7 @@ import math
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray, String
@@ -35,7 +37,7 @@ class WallFollowerNode(Node):
     def __init__(self):
         super().__init__('wall_follower')
 
-        # ---------------- parameters (override in config/wall_follower.yaml)
+        # ---------------- parameters (override with --ros-args -p name:=value)
         self.declare_parameter('scan_topic', '/robot_8/scan')
         self.declare_parameter('cmd_vel_topic', '/robot_8/cmd_vel')
         self.declare_parameter('drive', True)          # False = perception only
@@ -45,53 +47,68 @@ class WallFollowerNode(Node):
         self.declare_parameter('lidar_angle_offset_deg', 0.0)
         self.declare_parameter('lidar_reversed', False)
         self.declare_parameter('lidar_median_filter', 3)
+        # Ignore parts of the robot seen by the LiDAR: flat list of
+        # [from_deg, to_deg, max_range_m, ...] in raw LiDAR angles
+        # (the 'raw angle' printed by lidar_check). Empty = off.
+        self.declare_parameter('lidar_ignore_sectors', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('opening_distance', 0.50)
 
+        # Robot geometry: 35 cm round body, LiDAR 20 cm behind the front edge.
         defaults = ControllerParams()
-        self.declare_parameter('desired_distance', defaults.desired_distance)
-        self.declare_parameter('look_ahead', defaults.look_ahead)
-        self.declare_parameter('beam_angle_deg', math.degrees(defaults.beam_angle))
-        self.declare_parameter('kp', defaults.kp)
-        self.declare_parameter('kd', defaults.kd)
+        self.declare_parameter('robot_radius', defaults.robot_radius)
+        self.declare_parameter('lidar_to_front', 0.20)
+
+        self.declare_parameter('wall_clearance', defaults.wall_clearance)
+        self.declare_parameter('follow_range', defaults.follow_range)
+        self.declare_parameter('approach_angle_deg',
+                               math.degrees(defaults.approach_angle))
+        self.declare_parameter('k_distance', defaults.k_distance)
+        self.declare_parameter('k_bearing', defaults.k_bearing)
         self.declare_parameter('max_linear', defaults.max_linear)
         self.declare_parameter('min_linear', defaults.min_linear)
+        self.declare_parameter('corner_linear', defaults.corner_linear)
         self.declare_parameter('max_angular', defaults.max_angular)
+        self.declare_parameter('turn_angular', defaults.turn_angular)
+        self.declare_parameter('side_margin', defaults.side_margin)
         self.declare_parameter('front_stop', defaults.front_stop)
         self.declare_parameter('front_clear', defaults.front_clear)
         self.declare_parameter('front_slow', defaults.front_slow)
-        self.declare_parameter('wall_lost_distance', defaults.wall_lost_distance)
-        self.declare_parameter('turn_angular', defaults.turn_angular)
-        self.declare_parameter('corner_linear', defaults.corner_linear)
-        self.declare_parameter('corner_angular', defaults.corner_angular)
-        self.declare_parameter('corner_advance', defaults.corner_advance)
-        self.declare_parameter('corner_timeout', defaults.corner_timeout)
 
         g = self._param
         side = g('follow_side').lower()
         if side not in ('left', 'right'):
             raise ValueError("follow_side must be 'left' or 'right'")
 
+        ignore = list(self.get_parameter_or(
+            'lidar_ignore_sectors',
+            Parameter('lidar_ignore_sectors', Parameter.Type.DOUBLE_ARRAY, [])).value)
+        if len(ignore) % 3:
+            raise ValueError('lidar_ignore_sectors needs triples: '
+                             '[from_deg, to_deg, max_range_m, ...]')
+        ignore_sectors = tuple(
+            (math.radians(ignore[i]), math.radians(ignore[i + 1]), ignore[i + 2])
+            for i in range(0, len(ignore), 3))
+
         self.lidar = LidarProcessor(ScanConfig(
             angle_offset=math.radians(g('lidar_angle_offset_deg')),
             reversed=g('lidar_reversed'),
+            lidar_x=g('robot_radius') - g('lidar_to_front'),
+            ignore_sectors=ignore_sectors,
             median_filter_size=g('lidar_median_filter'),
         ))
         self.controller = WallFollowController(ControllerParams(
             side=+1 if side == 'left' else -1,
-            desired_distance=g('desired_distance'),
-            look_ahead=g('look_ahead'),
-            beam_angle=math.radians(g('beam_angle_deg')),
-            kp=g('kp'), kd=g('kd'),
+            robot_radius=g('robot_radius'),
+            wall_clearance=g('wall_clearance'),
+            follow_range=g('follow_range'),
+            approach_angle=math.radians(g('approach_angle_deg')),
+            k_distance=g('k_distance'), k_bearing=g('k_bearing'),
             max_linear=g('max_linear'), min_linear=g('min_linear'),
-            max_angular=g('max_angular'),
+            corner_linear=g('corner_linear'),
+            max_angular=g('max_angular'), turn_angular=g('turn_angular'),
+            side_margin=g('side_margin'),
             front_stop=g('front_stop'), front_clear=g('front_clear'),
             front_slow=g('front_slow'),
-            wall_lost_distance=g('wall_lost_distance'),
-            turn_angular=g('turn_angular'),
-            corner_linear=g('corner_linear'),
-            corner_angular=g('corner_angular'),
-            corner_advance=g('corner_advance'),
-            corner_timeout=g('corner_timeout'),
         ))
         self.drive = g('drive')
         self.opening_distance = g('opening_distance')
@@ -115,7 +132,8 @@ class WallFollowerNode(Node):
         self.create_timer(0.5, self._log_status)
 
         self.get_logger().info(
-            f"Wall follower ready: following {side} wall, "
+            f"Wall follower ready: following {side} wall at "
+            f"{self.controller.p.desired_distance:.3f} m from the centre, "
             f"scan={g('scan_topic')}, cmd_vel={g('cmd_vel_topic')}, "
             f"drive={self.drive}")
 
