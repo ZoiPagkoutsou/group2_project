@@ -1,4 +1,5 @@
-"""Wall-following controller for a round robot (pure Python, no ROS).
+"""
+Wall-following controller for a round robot (pure Python, no ROS).
 
 All distances are from the robot centre (see lidar_processing).
 
@@ -24,9 +25,9 @@ and finish are both on the outer boundary. Loops can trap a pure wall follower
 only if the goal sits on an "island" wall that is not connected to the start.
 """
 
-import math
 from dataclasses import dataclass
 from enum import Enum
+import math
 
 from create3_pkg.lidar_processing import LidarProcessor, wrap_angle
 
@@ -84,7 +85,8 @@ class WallFollowController:
         self.last_error = 0.0  # distance error, exposed for logging / plotting
 
     def compute(self, lidar: LidarProcessor, now: float) -> Command:
-        """Return the velocity command for the current scan.
+        """
+        Return the velocity command for the current scan.
 
         `now` (s) is unused by this controller; kept for the node interface.
         """

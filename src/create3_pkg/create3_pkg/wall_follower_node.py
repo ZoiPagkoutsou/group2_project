@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ROS 2 node: LiDAR-based wall following for the iRobot Create 3.
+"""
+ROS 2 node: LiDAR-based wall following for the iRobot Create 3.
 
 Subscribes
     <scan_topic>      sensor_msgs/LaserScan   (default /robot_8/scan)
@@ -18,18 +19,17 @@ navigation node. Set `drive:=false` to run perception only (robot stays still).
 
 import math
 
-import rclpy
+from create3_pkg.controller import (Command, ControllerParams,
+                                    WallFollowController)
+from create3_pkg.lidar_processing import (describe_surroundings,
+                                          LidarProcessor, ScanConfig)
 from geometry_msgs.msg import Twist
+import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray, String
-
-from create3_pkg.controller import (Command, ControllerParams,
-                                    WallFollowController)
-from create3_pkg.lidar_processing import (LidarProcessor, ScanConfig,
-                                          describe_surroundings)
 
 
 class WallFollowerNode(Node):
@@ -91,7 +91,7 @@ class WallFollowerNode(Node):
 
         self.lidar = LidarProcessor(ScanConfig(
             angle_offset=math.radians(g('lidar_angle_offset_deg')),
-            reversed=g('lidar_reversed'),
+            scan_reversed=g('lidar_reversed'),
             lidar_x=g('robot_radius') - g('lidar_to_front'),
             ignore_sectors=ignore_sectors,
             median_filter_size=g('lidar_median_filter'),
@@ -131,11 +131,12 @@ class WallFollowerNode(Node):
         self.create_timer(1.0 / g('control_rate'), self._on_timer)
         self.create_timer(0.5, self._log_status)
 
+        scan_topic, cmd_vel_topic = g('scan_topic'), g('cmd_vel_topic')
         self.get_logger().info(
-            f"Wall follower ready: following {side} wall at "
-            f"{self.controller.p.desired_distance:.3f} m from the centre, "
-            f"scan={g('scan_topic')}, cmd_vel={g('cmd_vel_topic')}, "
-            f"drive={self.drive}")
+            f'Wall follower ready: following {side} wall at '
+            f'{self.controller.p.desired_distance:.3f} m from the centre, '
+            f'scan={scan_topic}, cmd_vel={cmd_vel_topic}, '
+            f'drive={self.drive}')
 
     def _param(self, name):
         return self.get_parameter(name).value

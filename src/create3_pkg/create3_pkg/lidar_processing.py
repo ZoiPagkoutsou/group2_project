@@ -1,4 +1,5 @@
-"""LiDAR processing for maze navigation (pure Python, no ROS dependency).
+"""
+LiDAR processing for maze navigation (pure Python, no ROS dependency).
 
 Keeping this module free of ROS makes it easy to unit-test offline with
 recorded or synthetic scans.
@@ -11,8 +12,8 @@ LiDAR (the LiDAR position is given in ScanConfig). Angle convention
     -pi/2   = robot right
 """
 
-import math
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
@@ -23,7 +24,8 @@ def wrap_angle(angle):
 
 
 def circular_median_filter(values, size):
-    """Median over `size` neighbouring beams (wraps around 360 deg).
+    """
+    Median over `size` neighbouring beams (wraps around 360 deg).
 
     NaN marks an invalid beam and is ignored; a beam stays NaN only if more
     than half of its neighbourhood is invalid (so isolated dropouts are
@@ -50,7 +52,7 @@ class ScanConfig:
     # Find it once by putting an object in front of the robot (see lidar_check).
     angle_offset: float = 0.0
     # True if the LiDAR reports angles clockwise (e.g. mounted upside down).
-    reversed: bool = False
+    scan_reversed: bool = False
     # LiDAR position relative to the robot centre (m, +x = forward).
     # Create 3: 35 cm body, LiDAR 20 cm behind the front edge -> 0.175 - 0.20.
     lidar_x: float = -0.025
@@ -60,7 +62,7 @@ class ScanConfig:
     max_valid_range: float = 8.0
     # Parts of the robot the LiDAR sees (cables, brackets): readings closer
     # than max_range between two RAW LiDAR angles (rad, as in the LaserScan,
-    # before angle_offset/reversed) are ignored. ((from, to, max_range), ...)
+    # before angle_offset/scan_reversed) are ignored. ((from, to, max_range), ...)
     ignore_sectors: tuple = ()
     # Half-width of the angular window used to compute a robust distance (rad).
     sector_half_width: float = math.radians(8.0)
@@ -86,7 +88,7 @@ class LidarProcessor:
         """Store a new scan. Arguments mirror sensor_msgs/LaserScan fields."""
         ranges = np.asarray(ranges, dtype=float)
         raw_angles = wrap_angle(angle_min + angle_increment * np.arange(ranges.size))
-        angles = -raw_angles if self.config.reversed else raw_angles
+        angles = -raw_angles if self.config.scan_reversed else raw_angles
         angles = wrap_angle(angles + self.config.angle_offset)
 
         lo = max(range_min, self.config.min_valid_range)
@@ -111,7 +113,8 @@ class LidarProcessor:
         return self._ranges.size > 0
 
     def distance_at(self, angle, half_width=None):
-        """Median distance inside a window around `angle` (robot frame).
+        """
+        Median distance inside a window around `angle` (robot frame).
 
         The median rejects single noisy readings. Returns inf when there is
         no valid reading in the window (open space or out of range).
@@ -140,9 +143,11 @@ class LidarProcessor:
         return float(self._ranges[i]), float(self._angles[i])
 
     def free_distance_ahead(self, half_width):
-        """How far the robot can drive straight before an obstacle enters a
-        circle of radius `half_width` around its centre.
+        """
+        Return how far the robot can drive straight before touching.
 
+        Touching = an obstacle enters a circle of radius `half_width`
+        around the robot centre.
         This is the swept path of a round robot: only points ahead of the
         centre with |y| < half_width can be hit. Negative = already too close.
         """
@@ -159,7 +164,8 @@ class LidarProcessor:
 
 @dataclass
 class Surroundings:
-    """Perception summary that the navigation node can use.
+    """
+    Perception summary that the navigation node can use.
 
     Distances are from the robot centre.
     """

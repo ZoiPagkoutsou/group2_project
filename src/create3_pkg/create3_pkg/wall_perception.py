@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 
+from irobot_create_msgs.msg import IrIntensityVector
 import rclpy
-
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from irobot_create_msgs.msg import IrIntensityVector
 
 
 class WallPerception(Node):
@@ -23,7 +22,6 @@ class WallPerception(Node):
         )
 
         self.get_logger().info('Wall perception started')
-
 
     def ir_callback(self, msg):
 
@@ -71,7 +69,8 @@ def main(args=None):
         pass
 
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():  # Ctrl+C may already have shut rclpy down
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
