@@ -24,9 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'talkerDemo = create3_pkg.talkerDemo:main',
-            'test_bluecolorlight = create3_pkg.test_bluecolorlight:main',
-            'test_subproximity_sensor = create3_pkg.test_subproximity_sensor:main',
+            'wall_perception = create3_pkg.wall_perception:main',
+            'wall_follower_node = create3_pkg.wall_follower_node:main',
         ],
     },
 )
