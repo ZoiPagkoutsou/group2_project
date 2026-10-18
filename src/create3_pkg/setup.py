@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'wall_perception = create3_pkg.wall_perception:main',
             'wall_follower_node = create3_pkg.wall_follower_node:main',
+            'movement_controller_new = create3_pkg.movement_controller_new:main',
         ],
     },
 )
