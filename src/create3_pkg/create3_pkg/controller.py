@@ -83,6 +83,8 @@ class WallFollowController:
         self.p = params
         self.state = State.FIND_WALL
         self.last_error = 0.0  # distance error, exposed for logging / plotting
+        self.in_narrow_gap = False  # last target came from a narrow gap
+        self.turn_direction = 0     # TURN_AWAY rotation (+1 left, -1 right)
 
     def compute(self, lidar: LidarProcessor, now: float) -> Command:
         """
@@ -97,8 +99,10 @@ class WallFollowController:
         # ---- safety first: something in the swept path right in front ----
         if free < p.front_stop or (self.state == State.TURN_AWAY
                                    and free < p.front_clear):
+            if self.state != State.TURN_AWAY:
+                self.turn_direction = self._turn_away_direction(lidar)
             self.state = State.TURN_AWAY
-            return Command(0.0, -s * p.turn_angular)
+            return Command(0.0, self.turn_direction * p.turn_angular)
 
         # Followed side, plus a little of the front on the other side so a
         # wall straight ahead also counts (inner corners).
@@ -110,7 +114,8 @@ class WallFollowController:
             return Command(self._speed(free, 0.0), 0.0)
 
         distance, bearing = nearest
-        error = distance - p.desired_distance  # > 0: too far from the wall
+        target = self._target_distance(lidar, distance, bearing)
+        error = distance - target  # > 0: too far from the wall
         self.last_error = error
 
         # Too far -> point the robot towards the wall (at most approach_angle),
@@ -139,6 +144,43 @@ class WallFollowController:
         if speed is None:
             speed = self._speed(free, angular)
         return Command(speed, angular)
+
+    def _target_distance(self, lidar, distance, bearing):
+        """
+        Distance to keep from the followed wall.
+
+        Normally desired_distance. In a gap narrower than twice that (a narrow
+        corridor or its entrance) the robot aims for the middle of the gap
+        instead, so it fits through. The gap is measured from the nearest
+        point on the followed side across the robot to the other side (see
+        LidarProcessor.gap_across); gaps the robot cannot fit through are
+        ignored.
+        """
+        p = self.p
+        gap = lidar.gap_across(distance, bearing, 2.0 * p.desired_distance)
+        self.in_narrow_gap = (2.0 * (p.robot_radius + p.side_margin) <= gap
+                              < 2.0 * p.desired_distance)
+        return 0.5 * gap if self.in_narrow_gap else p.desired_distance
+
+    def _turn_away_direction(self, lidar):
+        """
+        Rotation for TURN_AWAY: normally away from the followed wall.
+
+        In a narrow gap (e.g. arriving at a narrow corridor slightly
+        crooked) the robot instead turns to the side with more free space,
+        which is where the corridor continues.
+        """
+        p = self.p
+        s = p.side
+        if not self.in_narrow_gap:
+            return -s
+        half_width = p.robot_radius + p.side_margin
+
+        def most_free(direction):
+            return max(lidar.free_distance_along(direction * math.radians(a),
+                                                 half_width)
+                       for a in (15.0, 30.0, 45.0, 60.0))
+        return s if most_free(s) > most_free(-s) else -s
 
     def _speed(self, free, angular):
         """Slow down near obstacles in front and during sharp turns."""

@@ -4,6 +4,8 @@ ROS 2 node: LiDAR-based wall following for the iRobot Create 3.
 
 Subscribes
     <scan_topic>      sensor_msgs/LaserScan   (default /robot_8/scan)
+    <odom_topic>      nav_msgs/Odometry       (default /robot_8/odom,
+                                               only with use_goal:=true)
 Publishes
     <cmd_vel_topic>   geometry_msgs/Twist     (default /robot_8/cmd_vel)
     ~/distances       std_msgs/Float32MultiArray
@@ -11,19 +13,30 @@ Publishes
                       measured from the robot centre
     ~/situation       std_msgs/String  corridor | corner_left | corner_right |
                                        junction | dead_end
-    ~/state           std_msgs/String  controller state (FOLLOW_WALL, ...)
+    ~/state           std_msgs/String  controller state (FOLLOW_WALL, ...;
+                                       GO_TO_GOAL, GOAL_REACHED, ... with
+                                       use_goal:=true)
 
 The distances/situation topics are the perception output for the
 navigation node. Set `drive:=false` to run perception only (robot stays still).
+
+Set `use_goal:=true` to drive to a goal with DistBug (see goal_controller)
+instead of following the wall forever. The goal is given before the start,
+relative to the start pose: `goal_x` metres forward, `goal_y` metres left.
+With `auto_side:=true` (default) the side used to go round each obstacle is
+chosen from the LiDAR scan; `follow_side` is then only the fallback.
 """
 
 import math
 
 from create3_pkg.controller import (Command, ControllerParams,
                                     WallFollowController)
+from create3_pkg.goal_controller import (GoalParams, GoalState,
+                                         GoToGoalController)
 from create3_pkg.lidar_processing import (describe_surroundings,
                                           LidarProcessor, ScanConfig)
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -52,6 +65,16 @@ class WallFollowerNode(Node):
         # (the 'raw angle' printed by lidar_check). Empty = off.
         self.declare_parameter('lidar_ignore_sectors', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('opening_distance', 0.50)
+
+        # Go-to-goal (DistBug). Goal relative to the start pose:
+        # goal_x m forward, goal_y m left.
+        goal_defaults = GoalParams()
+        self.declare_parameter('use_goal', False)
+        self.declare_parameter('odom_topic', '/robot_8/odom')
+        self.declare_parameter('goal_x', goal_defaults.goal_x)
+        self.declare_parameter('goal_y', goal_defaults.goal_y)
+        self.declare_parameter('goal_tolerance', goal_defaults.goal_tolerance)
+        self.declare_parameter('auto_side', goal_defaults.auto_side)
 
         # Robot geometry: 35 cm round body, LiDAR 20 cm behind the front edge.
         defaults = ControllerParams()
@@ -111,6 +134,16 @@ class WallFollowerNode(Node):
             front_slow=g('front_slow'),
         ))
         self.drive = g('drive')
+        self.goal = None
+        if g('use_goal'):
+            self.goal = GoToGoalController(GoalParams(
+                goal_x=g('goal_x'), goal_y=g('goal_y'),
+                goal_tolerance=g('goal_tolerance'),
+                auto_side=g('auto_side'),
+            ), self.controller)
+        self.pose = None             # (x, y, yaw) from odometry
+        self.last_odom_time = None
+        self.goal_logged = False     # 'goal reached' printed once
         self.opening_distance = g('opening_distance')
         self.scan_timeout = g('scan_timeout')
 
@@ -119,6 +152,9 @@ class WallFollowerNode(Node):
         # best-effort LiDAR publishers.
         self.create_subscription(LaserScan, g('scan_topic'), self._on_scan,
                                  qos_profile_sensor_data)
+        if self.goal is not None:
+            self.create_subscription(Odometry, g('odom_topic'), self._on_odom,
+                                     qos_profile_sensor_data)
         self.cmd_pub = self.create_publisher(Twist, g('cmd_vel_topic'), 10)
         self.dist_pub = self.create_publisher(Float32MultiArray, '~/distances', 10)
         self.situation_pub = self.create_publisher(String, '~/situation', 10)
@@ -137,6 +173,12 @@ class WallFollowerNode(Node):
             f'{self.controller.p.desired_distance:.3f} m from the centre, '
             f'scan={scan_topic}, cmd_vel={cmd_vel_topic}, '
             f'drive={self.drive}')
+        if self.goal is not None:
+            goal_x, goal_y, auto_side = g('goal_x'), g('goal_y'), g('auto_side')
+            self.get_logger().info(
+                f'Go-to-goal: goal {goal_x:.2f} m forward, {goal_y:.2f} m '
+                f'left of the start pose (fixed at the first odometry message), '
+                f'auto_side={auto_side}')
 
     def _param(self, name):
         return self.get_parameter(name).value
@@ -151,8 +193,27 @@ class WallFollowerNode(Node):
             self.command = Command(0.0, 0.0)
             return
 
-        self.command = self.controller.compute(self.lidar, now)
+        if self.goal is None:
+            self.command = self.controller.compute(self.lidar, now)
+        elif self.pose is None:
+            self.command = Command(0.0, 0.0)  # wait for odometry
+        else:
+            self.command = self.goal.compute(self.lidar, *self.pose, now)
+            self._log_goal_finished()
         self._publish_perception()
+
+    def _on_odom(self, msg: Odometry):
+        pose = msg.pose.pose
+        q = pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.pose = (pose.position.x, pose.position.y, yaw)
+        self.last_odom_time = self.get_clock().now().nanoseconds * 1e-9
+        if not self.goal.started:
+            self.goal.set_start(*self.pose)
+            gx, gy = self.goal.goal
+            self.get_logger().info(
+                f'Start pose fixed; goal at odom ({gx:.2f}, {gy:.2f})')
 
     def _on_timer(self):
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -160,6 +221,10 @@ class WallFollowerNode(Node):
                       and now - self.last_scan_time < self.scan_timeout)
         if not scan_fresh:
             self.command = Command(0.0, 0.0)  # safety: no LiDAR -> stop
+        if self.goal is not None and (
+                self.last_odom_time is None
+                or now - self.last_odom_time >= self.scan_timeout):
+            self.command = Command(0.0, 0.0)  # safety: no odometry -> stop
         if self.drive:
             self._send(self.command)
 
@@ -169,7 +234,26 @@ class WallFollowerNode(Node):
             float(v) for v in (s.front, s.left, s.right,
                                s.front_left, s.front_right)]))
         self.situation_pub.publish(String(data=s.situation))
-        self.state_pub.publish(String(data=self.controller.state.value))
+        state = self.controller.state.value
+        if self.goal is not None:
+            state = self.goal.state.value
+            if self.goal.state == GoalState.FOLLOW_WALL:
+                state += f'({self._side_name()})/{self.controller.state.value}'
+        self.state_pub.publish(String(data=state))
+
+    def _side_name(self):
+        return 'left' if self.controller.p.side > 0 else 'right'
+
+    def _log_goal_finished(self):
+        if self.goal.finished and not self.goal_logged:
+            self.goal_logged = True
+            if self.goal.state == GoalState.GOAL_REACHED:
+                self.get_logger().info(
+                    f'GOAL REACHED ({self.goal.distance_to_goal:.2f} m away)')
+            else:
+                self.get_logger().error(
+                    'GOAL UNREACHABLE: went round the obstacle back to the '
+                    'hit point, stopping')
 
     def _log_status(self):
         if not self.lidar.has_data:
@@ -180,7 +264,12 @@ class WallFollowerNode(Node):
         self.get_logger().info(
             f'{self.controller.state.value:<11} | F {s.front:4.2f}  '
             f'L {s.left:4.2f}  R {s.right:4.2f} | {s.situation:<12} | '
-            f'v {self.command.linear:+.2f}  w {self.command.angular:+.2f}')
+            f'v {self.command.linear:+.2f}  w {self.command.angular:+.2f}'
+            + ('' if self.goal is None else
+               f' | {self.goal.state.value}'
+               + (f'({self._side_name()})'
+                  if self.goal.state == GoalState.FOLLOW_WALL else '')
+               + f' goal {self.goal.distance_to_goal:.2f} m'))
 
     def _send(self, command: Command):
         twist = Twist()

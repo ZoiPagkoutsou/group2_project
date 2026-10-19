@@ -1,3 +1,6 @@
+from glob import glob
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'create3_pkg'
@@ -10,6 +13,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'),
+            glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,6 +32,8 @@ setup(
             'wall_perception = create3_pkg.wall_perception:main',
             'wall_follower_node = create3_pkg.wall_follower_node:main',
             'movement_controller_new = create3_pkg.movement_controller_new:main',
+            'navigation_maze_solving = create3_pkg.navigation_maze_solving:main',
+            'heading_publisher = create3_pkg.heading_publisher:main',
         ],
     },
 )
