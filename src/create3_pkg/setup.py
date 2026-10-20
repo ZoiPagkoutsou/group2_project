@@ -34,6 +34,7 @@ setup(
             'movement_controller_new = create3_pkg.movement_controller_new:main',
             'navigation_maze_solving = create3_pkg.navigation_maze_solving:main',
             'heading_publisher = create3_pkg.heading_publisher:main',
+            'localization_node = create3_pkg.localization_node:main',
         ],
     },
 )

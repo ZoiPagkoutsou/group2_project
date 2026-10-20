@@ -5,7 +5,8 @@ B is given before the start, relative to the start pose:
     ros2 launch create3_pkg go_to_goal.launch.py goal_x:=2.0 goal_y:=1.0
     -> 2 m forward, 1 m left. Negative goal_y = right, negative goal_x = back.
 
-The wall follower node runs DistBug: it drives straight at the goal, goes
+The localization node turns odometry into the pose relative to the start;
+the wall follower node runs DistBug with that pose: it drives straight at the goal, goes
 round any obstacle in the way (choosing the shorter side with the LiDAR when
 auto_side is true), and stops when it reaches the goal.
 """
@@ -33,6 +34,11 @@ def generate_launch_description():
             description='true = choose the side for each obstacle from the '
                         'LiDAR; false = always use follow_side'),
         DeclareLaunchArgument(
+            'on_loop', default_value='retry',
+            description='After a lap round an obstacle: retry = go round '
+                        'the other way, then explore; stop = stop with '
+                        'GOAL UNREACHABLE'),
+        DeclareLaunchArgument(
             'follow_side', default_value='right',
             description='Side used to go round obstacles when auto_side is '
                         "false (fallback otherwise): 'right' or 'left'"),
@@ -40,6 +46,14 @@ def generate_launch_description():
 
     def as_float(name):
         return ParameterValue(LaunchConfiguration(name), value_type=float)
+
+    localization = Node(
+        package='create3_pkg',
+        executable='localization_node',
+        name='localization',
+        namespace='robot_8',
+        output='screen',
+    )
 
     wall_follower = Node(
         package='create3_pkg',
@@ -56,7 +70,9 @@ def generate_launch_description():
             'auto_side': ParameterValue(LaunchConfiguration('auto_side'),
                                         value_type=bool),
             'follow_side': LaunchConfiguration('follow_side'),
+            'on_loop': LaunchConfiguration('on_loop'),
+            'pose_topic': '/robot_8/localization/pose',
         }],
     )
 
-    return LaunchDescription(arguments + [wall_follower])
+    return LaunchDescription(arguments + [localization, wall_follower])

@@ -82,7 +82,6 @@ class WallFollowController:
     def __init__(self, params: ControllerParams):
         self.p = params
         self.state = State.FIND_WALL
-        self.last_error = 0.0  # distance error, exposed for logging / plotting
         self.in_narrow_gap = False  # last target came from a narrow gap
         self.turn_direction = 0     # TURN_AWAY rotation (+1 left, -1 right)
 
@@ -116,7 +115,6 @@ class WallFollowController:
         distance, bearing = nearest
         target = self._target_distance(lidar, distance, bearing)
         error = distance - target  # > 0: too far from the wall
-        self.last_error = error
 
         # Too far -> point the robot towards the wall (at most approach_angle),
         # too close -> away from it. Pointing towards a right wall by `alpha`

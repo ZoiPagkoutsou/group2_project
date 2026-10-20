@@ -127,13 +127,6 @@ class LidarProcessor:
             return float('inf')
         return float(np.median(in_window))
 
-    def min_distance_in(self, angle_from, angle_to):
-        """Closest valid reading between two robot-frame angles (inclusive)."""
-        mask = self._sector_mask(angle_from, angle_to)
-        if not np.any(mask):
-            return float('inf')
-        return float(np.min(self._ranges[mask]))
-
     def nearest_point(self, angle_from, angle_to, max_distance=float('inf')):
         """(distance, bearing) of the closest point in a sector, or None."""
         mask = self._sector_mask(angle_from, angle_to) & (self._ranges <= max_distance)

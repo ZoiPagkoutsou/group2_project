@@ -101,7 +101,8 @@ ros2 launch create3_pkg maze.launch.py ir_threshold:=600
 |---|---|---|---|
 | `sensors_launch.py namespace:="robot_8"` (terminal 1) | `/robot_8/rplidar_node` | `rplidar_composition` | `rplidar_ros` (LiDAR driver) |
 | | `/robot_8/static_transform_publisher` | `static_transform_publisher` | `tf2_ros` (LiDAR position) |
-| `go_to_goal.launch.py` (Mode A) | `/robot_8/wall_follower` | `wall_follower_node` — `wall_follower_node.py` + `goal_controller.py`, `controller.py`, `lidar_processing.py` | `create3_pkg` |
+| `go_to_goal.launch.py` (Mode A) | `/robot_8/localization` | `localization_node` — `localization_node.py` | `create3_pkg` |
+| | `/robot_8/wall_follower` | `wall_follower_node` — `wall_follower_node.py` + `goal_controller.py`, `controller.py`, `lidar_processing.py` | `create3_pkg` |
 | `maze.launch.py standalone:=true` (Mode B) | `/robot_8/wall_follower` | `wall_follower_node` — `wall_follower_node.py` + `controller.py`, `lidar_processing.py` | `create3_pkg` |
 | `maze.launch.py` (Mode C) | `/robot_8/wall_follower` (perception only, `drive:=false`) | `wall_follower_node` — `wall_follower_node.py` | `create3_pkg` |
 | | `/heading_publisher` | `heading_publisher` — `heading_publisher.py` | `create3_pkg` |
@@ -112,7 +113,8 @@ ros2 launch create3_pkg maze.launch.py ir_threshold:=600
 
 | Node | Subscribes | Publishes / uses |
 |---|---|---|
-| `wall_follower` (Mode A) | `/robot_8/scan`, `/robot_8/odom` | `/robot_8/cmd_vel`, `~/state`, `~/distances`, `~/situation` |
+| `localization` (Mode A) | `/robot_8/odom` | `/robot_8/localization/pose` (pose relative to the start), `/robot_8/localization/heading`, `/robot_8/localization/distance` |
+| `wall_follower` (Mode A) | `/robot_8/scan`, `/robot_8/localization/pose` | `/robot_8/cmd_vel`, `~/state`, `~/distances`, `~/situation` |
 | `wall_follower` (Mode B) | `/robot_8/scan` | `/robot_8/cmd_vel`, `~/state`, `~/distances`, `~/situation` |
 | `wall_follower` (Mode C) | `/robot_8/scan` | `~/distances`, `~/situation`, `~/state` (no driving) |
 | `heading_publisher` | `/robot_8/odom` | `/robot_8/heading`, `/robot_8/accumulated_heading` |
@@ -129,6 +131,7 @@ source /opt/ros/jazzy/setup.bash
 ros2 topic echo /robot_8/wall_follower/state       # GO_TO_GOAL, FOLLOW_WALL(left)/..., GOAL_REACHED ...
 ros2 topic echo /robot_8/wall_follower/distances   # [front, left, right, front_left, front_right] m
 ros2 topic hz /robot_8/odom                        # odometry must arrive
+ros2 topic echo /robot_8/localization/pose         # Mode A: pose relative to the start (x forward, y left)
 ros2 topic echo /movement_command                  # Mode C only
 ros2 topic echo /movement_status                   # Mode C only
 ```
@@ -143,7 +146,7 @@ when LiDAR or odometry data stop arriving for 0.5 s.
 | Message / problem | Fix |
 |---|---|
 | `Waiting for LiDAR data...` | Start the LiDAR (step 2) and check `ros2 topic hz /robot_8/scan` |
-| Robot does not move in Mode A, no `Start pose fixed` line | No odometry: check `ros2 topic hz /robot_8/odom` |
+| Robot does not move in Mode A, no `Start pose fixed` line | No pose: check `ros2 topic hz /robot_8/odom` and `ros2 topic hz /robot_8/localization/pose` |
 | `Package 'create3_pkg' not found` | `source install/setup.bash` in `~/create3_ws` (after building) |
 | No robot topics in `ros2 topic list` | Check `ROS_DOMAIN_ID=8`, same WiFi as the robot, robot fully booted |
 | Stops a bit short of B | Lower the tolerance: `goal_tolerance:=0.03` |
