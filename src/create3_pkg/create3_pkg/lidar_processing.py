@@ -127,13 +127,6 @@ class LidarProcessor:
             return float('inf')
         return float(np.median(in_window))
 
-    def min_distance_in(self, angle_from, angle_to):
-        """Closest valid reading between two robot-frame angles (inclusive)."""
-        mask = self._sector_mask(angle_from, angle_to)
-        if not np.any(mask):
-            return float('inf')
-        return float(np.min(self._ranges[mask]))
-
     def nearest_point(self, angle_from, angle_to, max_distance=float('inf')):
         """(distance, bearing) of the closest point in a sector, or None."""
         mask = self._sector_mask(angle_from, angle_to) & (self._ranges <= max_distance)
@@ -151,11 +144,75 @@ class LidarProcessor:
         This is the swept path of a round robot: only points ahead of the
         centre with |y| < half_width can be hit. Negative = already too close.
         """
-        mask = (self._x > 0.0) & (np.abs(self._y) < half_width)
+        return self.free_distance_along(0.0, half_width)
+
+    def free_distance_along(self, bearing, half_width):
+        """
+        Like free_distance_ahead, but driving straight along `bearing`.
+
+        `bearing` is a robot-frame angle (0 = front, +pi/2 = left), e.g. the
+        direction of a goal.
+        """
+        free, _ = self._swept_path(bearing, half_width)
+        return free
+
+    def gap_across(self, distance, bearing, max_distance):
+        """
+        Width of the gap the robot is in, measured from one wall point.
+
+        (distance, bearing) is a point on one side of the robot. Returns the
+        distance from it to the nearest point on the opposite side of the
+        robot (angle between the two seen from the centre > 90 deg) that is
+        within max_distance of the centre, or inf if there is none.
+        Independent of the robot heading, so it also works while turning
+        into a corridor entrance.
+        """
+        px, py = distance * math.cos(bearing), distance * math.sin(bearing)
+        mask = ((self._x * px + self._y * py < 0.0)
+                & (self._ranges <= max_distance))
         if not np.any(mask):
             return float('inf')
-        x, y = self._x[mask], self._y[mask]
-        return float(np.min(x - np.sqrt(half_width ** 2 - y ** 2)))
+        return float(np.min(np.hypot(self._x[mask] - px, self._y[mask] - py)))
+
+    def obstacle_edge(self, bearing, half_width, turn, max_gap):
+        """
+        End point of the obstacle that blocks the straight path along `bearing`.
+
+        Starts at the blocking point (see free_distance_along) and walks
+        through the scan points counter-clockwise (turn=+1, the obstacle's
+        left end) or clockwise (turn=-1, its right end) while neighbouring
+        points are closer than `max_gap` (a gap the robot cannot drive
+        through). Returns the (x, y) robot-frame position of the last point,
+        or None when nothing blocks the path or no end is found (the
+        obstacle surrounds the robot).
+        """
+        _, start = self._swept_path(bearing, half_width)
+        if start is None:
+            return None
+        order = np.argsort(self._angles)
+        pos = int(np.flatnonzero(order == start)[0])
+        last = start
+        for k in range(1, order.size):
+            i = order[(pos + turn * k) % order.size]
+            if math.hypot(self._x[i] - self._x[last],
+                          self._y[i] - self._y[last]) > max_gap:
+                return float(self._x[last]), float(self._y[last])
+            last = i
+        return None
+
+    def _swept_path(self, bearing, half_width):
+        """(free distance, index of the blocking point or None) along bearing."""
+        c, s = math.cos(bearing), math.sin(bearing)
+        # Point coordinates in a frame whose x axis points along `bearing`.
+        x = self._x * c + self._y * s
+        y = -self._x * s + self._y * c
+        mask = (x > 0.0) & (np.abs(y) < half_width)
+        if not np.any(mask):
+            return float('inf'), None
+        free = np.where(mask, x - np.sqrt(np.maximum(half_width ** 2 - y ** 2, 0.0)),
+                        np.inf)
+        i = int(np.argmin(free))
+        return float(free[i]), i
 
     def _sector_mask(self, angle_from, angle_to):
         lo, hi = sorted((angle_from, angle_to))
