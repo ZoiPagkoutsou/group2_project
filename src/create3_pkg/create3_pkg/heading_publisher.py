@@ -9,7 +9,7 @@ from rclpy.node import Node #import the Node class
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry # import Odometry message type 
 from std_msgs.msg import Float64 # Float message type 
-
+from rclpy.qos import qos_profile_sensor_data
 
 class HeadingPublisher(Node): 
 
@@ -48,7 +48,7 @@ class HeadingPublisher(Node):
             msg_type = Odometry,
             topic = "/robot_8/odom",
             callback = self.odom_callback,
-            qos_profile = 10
+            qos_profile = qos_profile_sensor_data
         )
 
         publish_rate = 1 # Hz
@@ -116,10 +116,10 @@ class HeadingPublisher(Node):
         self.position_publisher.publish(position_msg)
 
         self.get_logger().info(
-        f"Publishing heading: {heading_msg.data:.3f} radians,"
-        f"accumulated heading: {accumulated_msg.data:.3f} radians"
-        f"x: {self.relative_x:.3f} m,"
-        f"y: {self.relative_y:.3f} m"
+        f"Publishing heading: {heading_msg.data:.3f} radians, "
+        f"accumulated heading: {accumulated_msg.data:.3f} radians, "
+        f"x: {self.relative_x:.3f} m, "
+        f"y: {self.relative_y:.3f} m "
     )
         
 def main(args=None): 
