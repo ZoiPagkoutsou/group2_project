@@ -5,6 +5,7 @@
 import rclpy # ROS Client Library for Python
 import math
 from rclpy.node import Node #import the Node class 
+from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry # import Odometry message type 
@@ -27,21 +28,28 @@ class HeadingPublisher(Node):
     
         self.heading_publisher = self.create_publisher(
             msg_type = Float64,
-            topic = "robot_8/heading",
+            topic = "/robot_8/heading",
             qos_profile=10,
         ) 
 
+        # Position publisher
+        self.position_publisher = self.create_publisher(
+            Point,
+            "/robot_8/position",
+            qos_profile = 10
+        )
+        
         self.accumulated_publisher = self.create_publisher(
             msg_type=Float64,
             topic='/robot_8/accumulated_heading',
-            qos_profile=10
+            qos_profile = 10
         )
         
         self.odom_subscription = self.create_subscription(
             msg_type = Odometry,
-            topic = "robot_8/odom",
+            topic = "/robot_8/odom",
             callback = self.odom_callback,
-            qos_profile = 10
+           qos_profile = qos_profile_sensor_data
         )
 
         publish_rate = 1 # Hz
@@ -69,7 +77,7 @@ class HeadingPublisher(Node):
         self.theta_z = yaw_z
         self.yaw = yaw_z
         
-        if self.self.yaw_ref is None:
+        if self.yaw_ref is None:
             self.xref = self.x 
             self.yref = self.y
             self.theta_zref = self.theta_z 
@@ -90,8 +98,8 @@ class HeadingPublisher(Node):
         dx = self.x - self.xref
         dy = self.y - self.yref
 
-        self.relative_x = -math.cos(self.theta_zref) * dx + math.sin(self.theta_zref) *dy
-
+        self.relative_x = (math.cos(self.theta_zref) * dx + math.sin(self.theta_zref) * dy)
+        self.relative_y = (-math.sin(self.theta_zref) * dx + math.cos(self.theta_zref) * dy)
         self.displacement = math.hypot(self.relative_x, self.relative_y)
 
     def timer_callback(self): 
@@ -118,9 +126,13 @@ class HeadingPublisher(Node):
 def main(args=None): 
     rclpy.init(args=args)
     heading_publisher = HeadingPublisher()
-    rclpy.spin(heading_publisher)
-    heading_publisher.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(heading_publisher)
+    except KeyboardInterrupt: 
+        pass
+    finally: 
+        heading_publisher.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__': 
     main()
