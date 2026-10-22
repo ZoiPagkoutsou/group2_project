@@ -200,6 +200,13 @@ class LidarProcessor:
             last = i
         return None
 
+    def blocking_point(self, bearing, half_width):
+        """(x, y) robot-frame point that blocks the path along `bearing`."""
+        _, i = self._swept_path(bearing, half_width)
+        if i is None:
+            return None
+        return float(self._x[i]), float(self._y[i])
+
     def _swept_path(self, bearing, half_width):
         """(free distance, index of the blocking point or None) along bearing."""
         c, s = math.cos(bearing), math.sin(bearing)

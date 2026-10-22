@@ -14,7 +14,9 @@ FOLLOW_WALL  path to the goal blocked: follow the obstacle with the
              (DistBug leave rule)
 EXPLORE      fallback after laps round the same obstacle on both sides:
              plain wall following (visits every corridor of a maze) until
-             the robot passes the goal
+             the robot passes the goal. A lap in EXPLORE means the robot is
+             circling an island: it drives straight across to a different
+             wall and explores along that one.
 GOAL_REACHED within goal_tolerance of the goal, or as close as a wall lets
              the robot get to a goal right next to it: stop
 UNREACHABLE  only with on_loop='stop': a lap round the obstacle, back at the
@@ -82,6 +84,16 @@ class GoalParams:
     # Goal against a wall: reached this close if the way is blocked. Smaller
     # than robot radius + 10 cm wall, so it never counts through a wall.
     near_wall_radius: float = 0.25
+    # Hit again without driving this far since leaving the wall ...
+    min_progress: float = 0.05
+    # ... then follow the wall at least this far before leaving again
+    # (stops turning back and forth on the spot).
+    commit_distance: float = 0.40
+    # A leave after which the robot drove this far without getting closer
+    # to the goal counts as failed (next leave must promise more progress).
+    failed_leave_distance: float = 0.25
+    # EXPLORE: drive at most this far to reach a different wall.
+    cross_max: float = 3.0
 
 
 class GoToGoalController:
@@ -107,6 +119,13 @@ class GoToGoalController:
         self.last_yaw = None
         self.laps = 0                # laps round the current obstacle
         self.aligning = False        # turning to put the obstacle on the side
+        self.commit = 0.0            # wall length to follow before leaving
+        self.crossing = None         # EXPLORE: heading (odom yaw) to a new wall
+        self.cross_from = None       # where the crossing started
+        self.crossings = 0           # how often the robot switched walls
+        self.align_point = None      # odom (x, y) of the obstacle to line up with
+        self.leave_d_min = None      # d_min when the robot last left a wall
+        self.failed_leaves = 0       # leaves in a row that brought no progress
 
     @property
     def started(self):
@@ -151,12 +170,20 @@ class GoToGoalController:
             self.state = GoalState.GOAL_REACHED
             return Command(0.0, 0.0)
 
+        # A straight drive gets the robot close enough to the goal (a goal
+        # right next to a wall cannot be reached closer). Across a 10 cm wall
+        # this is never true. Used both for 'blocked' and for leaving a wall,
+        # so the two can never contradict each other.
+        reach = p.near_wall_radius - self.wall.p.front_stop - 0.01
+        goal_in_reach = self.distance_to_goal - free_to_goal <= reach
+
         if self.state == GoalState.GO_TO_GOAL:
             if self.last_xy is not None:
                 self.since_leave += math.hypot(x - self.last_xy[0],
                                                y - self.last_xy[1])
                 self.last_xy = (x, y)
-            if free_to_goal < min(p.blocked_distance, self.distance_to_goal):
+            if (free_to_goal < min(p.blocked_distance, self.distance_to_goal)
+                    and not goal_in_reach):
                 if abs(goal_bearing) > p.hit_facing:
                     # Face the goal first (safe: the robot is round), so the
                     # obstacle is in front when the side is chosen.
@@ -167,10 +194,13 @@ class GoToGoalController:
                 return self._drive_to_goal(lidar, goal_bearing)
 
         # ---- FOLLOW_WALL / EXPLORE
+        if self.crossing is not None:
+            return self._cross(lidar, x, y, yaw)
         if self.aligning:
-            if not self._obstacle_on_side(lidar):
+            if not self._obstacle_on_side(lidar, x, y, yaw):
                 return Command(0.0, -self.wall.p.side * p.align_angular)
             self.aligning = False
+            self.align_point = None
             self._reset_lap(x, y, yaw)
 
         self.followed += math.hypot(x - self.last_xy[0], y - self.last_xy[1])
@@ -179,24 +209,39 @@ class GoToGoalController:
         self.last_yaw = yaw
 
         if self.state == GoalState.FOLLOW_WALL:
-            self.leave_count = (self.leave_count + 1
-                                if self._can_leave(free_to_goal) else 0)
+            can_leave = (self.followed >= self.commit
+                         and self._can_leave(lidar, goal_bearing, goal_in_reach))
+            self.leave_count = self.leave_count + 1 if can_leave else 0
             if self.leave_count >= p.leave_confirm:
                 self.state = GoalState.GO_TO_GOAL
                 self.since_leave = 0.0
+                self.leave_d_min = self.d_min
                 return self._drive_to_goal(lidar, goal_bearing)
 
-            hx, hy = self.hit_point
-            if (self.followed > p.min_loop_length
-                    and math.hypot(x - hx, y - hy) < p.hit_return_radius
-                    and abs(self.turned) > p.lap_turn):
+            if self._lap_closed(x, y):
                 return self._lap_done(x, y, yaw)
+
+        elif self._lap_closed(x, y):
+            # EXPLORE went once round this wall: it is an island that does
+            # not lead to the goal, so switch to a different wall.
+            return self._start_crossing(lidar, x, y, yaw, goal_bearing)
 
         return self.wall.compute(lidar, now)
 
     def _start_wall_follow(self, lidar, x, y, yaw, goal_bearing):
         self.state = GoalState.FOLLOW_WALL
         self.leave_count = 0
+        # Did the last leave get the robot closer to the goal? Only count it
+        # as failed if the robot really drove (no-move re-hits are handled by
+        # commit_distance below, and are often just LiDAR noise).
+        if self.leave_d_min is not None:
+            if self.distance_to_goal <= self.leave_d_min - 0.5 * self.p.leave_step:
+                self.failed_leaves = 0
+            elif self.since_leave >= self.p.failed_leave_distance:
+                self.failed_leaves += 1
+        # Back at a wall without having moved: commit to the wall for a while.
+        self.commit = (self.p.commit_distance
+                       if self.since_leave < self.p.min_progress else 0.0)
         # Hit again right after leaving = the same obstacle: keep the side
         # (and the wall-follow state), otherwise choose afresh.
         if self.since_leave > self.p.same_obstacle:
@@ -204,6 +249,13 @@ class GoToGoalController:
             self.laps = 0
             if self.p.auto_side:
                 self.wall.p.side = self._choose_side(lidar, goal_bearing)
+        # Line up with the obstacle that blocked the way to the goal - not
+        # with whatever wall happens to be nearest.
+        block = lidar.blocking_point(goal_bearing, self.half_width)
+        if block is not None:
+            c, s = math.cos(yaw), math.sin(yaw)
+            self.align_point = (x + c * block[0] - s * block[1],
+                                y + s * block[0] + c * block[1])
         self.aligning = True
         self._reset_lap(x, y, yaw)
 
@@ -214,6 +266,60 @@ class GoToGoalController:
         self.turned = 0.0
         self.last_xy = (x, y)
         self.last_yaw = yaw
+
+    def _lap_closed(self, x, y):
+        """Back at the hit point after a full turn round the wall."""
+        p = self.p
+        hx, hy = self.hit_point
+        return (self.followed > p.min_loop_length
+                and math.hypot(x - hx, y - hy) < p.hit_return_radius
+                and abs(self.turned) > p.lap_turn)
+
+    def _start_crossing(self, lidar, x, y, yaw, goal_bearing):
+        """Pick a direction away from the followed wall, towards open space."""
+        s = self.wall.p.side
+        best, best_score = None, 0.0
+        for deg in range(-180, 180, 10):
+            b = math.radians(deg)
+            # Only directions on the other side from the followed wall.
+            if not math.radians(15.0) <= -s * b <= math.radians(165.0):
+                continue
+            free = min(lidar.free_distance_along(b, self.half_width),
+                       self.p.cross_max)
+            # Prefer open space, then the direction of the goal.
+            score = free - 0.3 * abs(float(wrap_angle(b - goal_bearing))) / math.pi
+            if best is None or score > best_score:
+                best, best_score = b, score
+        self.crossings += 1
+        if best is None or lidar.free_distance_along(best, self.half_width) < 0.3:
+            # Nowhere to go: follow the other side of this wall instead.
+            self.wall.p.side = -s
+            self.aligning = True
+            self._reset_lap(x, y, yaw)
+            return Command(0.0, 0.0)
+        self.crossing = float(wrap_angle(yaw + best))
+        self.cross_from = (x, y)
+        return Command(0.0, 0.0)
+
+    def _cross(self, lidar, x, y, yaw):
+        """Turn to the crossing heading, drive straight to the next wall."""
+        p, w = self.p, self.wall.p
+        error = float(wrap_angle(self.crossing - yaw))
+        angular = clamp(p.k_heading * error, -p.max_angular, p.max_angular)
+        if abs(error) > math.radians(10.0):
+            return Command(0.0, angular)
+        free = lidar.free_distance_ahead(w.robot_radius + w.side_margin)
+        driven = math.hypot(x - self.cross_from[0], y - self.cross_from[1])
+        if free < p.blocked_distance or driven > p.cross_max:
+            # Arrived at a (new) wall: explore along it.
+            self.crossing = None
+            self.wall.state = State.FIND_WALL
+            self.aligning = True
+            self._reset_lap(x, y, yaw)
+            return Command(0.0, 0.0)
+        span = max(w.front_slow - w.front_stop, 1e-3)
+        front_factor = clamp((free - w.front_stop) / span, 0.0, 1.0)
+        return Command(max(p.max_linear * front_factor, w.min_linear), angular)
 
     def _lap_done(self, x, y, yaw):
         """Went once round the obstacle without finding a way to the goal."""
@@ -236,9 +342,13 @@ class GoToGoalController:
         self._reset_lap(x, y, yaw)
         return Command(0.0, 0.0)
 
-    def _obstacle_on_side(self, lidar):
-        """Check that the nearest obstacle is where the wall follower looks."""
+    def _obstacle_on_side(self, lidar, x, y, yaw):
+        """Check that the obstacle to follow is on the chosen side."""
         w = self.wall.p
+        if self.align_point is not None:
+            ax, ay = self.align_point
+            bearing = float(wrap_angle(math.atan2(ay - y, ax - x) - yaw))
+            return w.side * bearing >= -math.radians(10.0)
         nearest = lidar.nearest_point(-math.pi, math.pi, max_distance=w.follow_range)
         if nearest is None:
             return True  # nothing near: let the wall follower find a wall
@@ -265,7 +375,7 @@ class GoToGoalController:
                 best_side, best_cost = side, cost
         return best_side
 
-    def _can_leave(self, free_to_goal):
+    def _can_leave(self, lidar, goal_bearing, goal_in_reach):
         """
         Leave rule of DistBug.
 
@@ -274,11 +384,15 @@ class GoToGoalController:
         obstacle) at least leave_step closer than the robot has ever been.
         """
         p = self.p
-        if free_to_goal >= self.distance_to_goal:
+        if goal_in_reach:
             return True
+        free_to_goal = lidar.free_distance_along(goal_bearing, self.half_width)
         end_distance = self.distance_to_goal - free_to_goal + p.blocked_distance
+        # Each failed leave (see _start_wall_follow) asks for one more step of
+        # progress, so a misleading free path cannot trap the robot.
+        step = p.leave_step * (1 + self.failed_leaves)
         return (free_to_goal > p.leave_clearance
-                and end_distance <= self.d_min - p.leave_step)
+                and end_distance <= self.d_min - step)
 
     def _drive_to_goal(self, lidar, goal_bearing):
         """Turn towards the goal; drive forward once roughly facing it."""

@@ -153,6 +153,7 @@ class WallFollowerNode(Node):
         self.last_pose_time = None
         self.goal_logged = False     # 'goal reached' printed once
         self.laps_logged = 0         # laps already reported
+        self.crossings_logged = 0    # wall switches already reported
         self.opening_distance = g('opening_distance')
         self.scan_timeout = g('scan_timeout')
 
@@ -266,6 +267,11 @@ class WallFollowerNode(Node):
                     'Lap round the obstacle without a way to the goal: '
                     f'trying the other way ({self._side_name()} wall)')
         self.laps_logged = laps
+        if self.goal.crossings > self.crossings_logged:
+            self.get_logger().warn(
+                'Explore lap round the same wall (an island): driving across '
+                'to a different wall')
+            self.crossings_logged = self.goal.crossings
 
     def _log_goal_finished(self):
         if self.goal.finished and not self.goal_logged:
