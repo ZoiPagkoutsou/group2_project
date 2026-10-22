@@ -3,19 +3,21 @@
 
 
 import rclpy # ROS Client Library for Python
-import math
+import math  # Math library of Python
 from rclpy.node import Node #import the Node class 
 
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point #Import Point message type
 from nav_msgs.msg import Odometry # import Odometry message type 
 from std_msgs.msg import Float64 # Float message type 
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data # Quality of Service Settings 
 
+# Construct the HeadingPublisher class
 class HeadingPublisher(Node): 
 
-    def __init__(self):
+    def __init__(self):   # Using the init method which will be called when a new object is created
         super().__init__("heading_publisher") 
 
+        # Starting Refrence Values
         self.yaw_ref = None
         self.x = 0.0; self.y = 0.0; self.theta_z = 0.0
         self.xref = 0.0; self.yref = 0.0; self.theta_zref = 0.0 
@@ -61,6 +63,7 @@ class HeadingPublisher(Node):
             f"The '{self.get_name()}' node is initialised."
         )
 
+    # Robots current position (odom frame)
     def odom_callback(self, msg_data: Odometry):
 
         # Robot's position
@@ -73,13 +76,12 @@ class HeadingPublisher(Node):
         t3 = +2.0 * (q.w * q.z + q.x * q.y)
         t4 = +1.0 -2.0 * (q.y * q.y + q.z * q.z)
         yaw_z = math.atan2(t3, t4) # in radians 
-        self.theta_z = yaw_z
         self.yaw = yaw_z
         
         if self.yaw_ref is None:
             self.xref = self.x 
             self.yref = self.y
-            self.theta_zref = self.theta_z 
+            self.theta_zref = self.yaw 
             self.yaw_ref = yaw_z 
             
         else:
